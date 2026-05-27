@@ -1,0 +1,203 @@
+<mxfile host="app.diagrams.net" modified="2026-05-27T00:00:00.000Z" agent="drawio" version="30.0.2">
+  <diagram name="Page-1" id="insurance-claims-ai-pipeline">
+    <mxGraphModel dx="1422" dy="762" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="2200" pageHeight="820" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="100" value="insurance-claims-ai-pipeline" style="text;fontSize=20;fontStyle=1;fontColor=#232F3E;align=center;verticalAlign=middle;html=1;" vertex="1" parent="1">
+          <mxGeometry x="0" y="16" width="2200" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Section labels -->
+        <mxCell id="101" value="Ingest" style="text;fontSize=11;fontStyle=1;fontColor=#545B64;align=center;html=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="320" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="102" value="Step Functions Standard Workflow" style="text;fontSize=11;fontStyle=1;fontColor=#545B64;align=center;html=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="80" width="1100" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="103" value="Persistence &amp; Notification" style="text;fontSize=11;fontStyle=1;fontColor=#545B64;align=center;html=1;" vertex="1" parent="1">
+          <mxGeometry x="1840" y="80" width="300" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="104" value="Map State (parallel fan-out)" style="text;fontSize=10;fontColor=#8C4FFF;align=center;fontStyle=3;html=1;" vertex="1" parent="1">
+          <mxGeometry x="820" y="82" width="180" height="18" as="geometry" />
+        </mxCell>
+
+        <!-- ================================================================
+             NODES
+             ================================================================ -->
+
+        <!-- S3 Intake -->
+        <mxCell id="110" value="S3&#xa;Intake Bucket" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#7AA116;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="60" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- EventBridge -->
+        <mxCell id="111" value="EventBridge&#xa;Manifest Rule" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.eventbridge;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#E7157B;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="240" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Step Functions -->
+        <mxCell id="112" value="Step Functions&#xa;Standard Workflow" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.step_functions;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#E7157B;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="430" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ReadManifest Lambda -->
+        <mxCell id="120" value="Lambda&#xa;ReadManifest" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="630" y="220" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ValidateArtifacts Lambda -->
+        <mxCell id="121" value="Lambda&#xa;ValidateArtifacts" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="630" y="440" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Rekognition -->
+        <mxCell id="130" value="Rekognition&#xa;DetectLabels" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.rekognition;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#8C4FFF;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="850" y="120" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Textract -->
+        <mxCell id="131" value="Textract&#xa;AnalyzeDocument" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.textract;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#8C4FFF;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="850" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ReadText Lambda -->
+        <mxCell id="132" value="Lambda&#xa;ReadText" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="850" y="530" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- NormalizeEvidence Lambda -->
+        <mxCell id="140" value="Lambda&#xa;NormalizeEvidence" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1070" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- SynthesizeVerdict Lambda -->
+        <mxCell id="141" value="Lambda&#xa;SynthesizeVerdict" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1270" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Bedrock -->
+        <mxCell id="142" value="Bedrock&#xa;Claude Haiku 4.5" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.bedrock;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#8C4FFF;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1270" y="120" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ApplyGuardrails Lambda -->
+        <mxCell id="150" value="Lambda&#xa;ApplyGuardrails" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1470" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- WriteArtifacts Lambda -->
+        <mxCell id="151" value="Lambda&#xa;WriteArtifacts" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda_function;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#ED7100;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1670" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- S3 Decisions -->
+        <mxCell id="160" value="S3&#xa;Decisions Bucket" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#7AA116;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1890" y="120" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- DynamoDB -->
+        <mxCell id="161" value="DynamoDB&#xa;ClaimsDecisions" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.dynamodb;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#C925D1;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1890" y="330" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- SNS -->
+        <mxCell id="162" value="SNS&#xa;AdjusterNotifications" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sns;labelPosition=center;verticalLabelPosition=bottom;verticalAlign=top;align=center;fillColor=#E7157B;strokeColor=none;fontColor=#232F3E;fontStyle=0;fontSize=11;sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[1,0.25,0],[1,0.5,0],[1,0.75,0],[1,1,0],[0.75,1,0],[0.5,1,0],[0.25,1,0],[0,1,0],[0,0.75,0],[0,0.5,0],[0,0.25,0]];" vertex="1" parent="1">
+          <mxGeometry x="1890" y="530" width="80" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ================================================================
+             EDGES
+             ================================================================ -->
+
+        <!-- S3 Intake -> EventBridge -->
+        <mxCell id="200" value="manifest.json" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="110" target="111" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- EventBridge -> Step Functions -->
+        <mxCell id="201" value="StartExecution" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="111" target="112" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Step Functions -> ReadManifest Lambda -->
+        <mxCell id="202" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="112" target="120" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ReadManifest -> ValidateArtifacts (vertical sequence) -->
+        <mxCell id="203" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="120" target="121" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ValidateArtifacts -> Rekognition (image branch, upper) -->
+        <mxCell id="204" value="image" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="121" target="130" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ValidateArtifacts -> Textract (document branch, middle) -->
+        <mxCell id="205" value="document" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="121" target="131" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ValidateArtifacts -> ReadText Lambda (text branch, lower) -->
+        <mxCell id="206" value="text" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="121" target="132" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Rekognition -> NormalizeEvidence (fan-in upper) -->
+        <mxCell id="207" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="130" target="140" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Textract -> NormalizeEvidence (fan-in middle) -->
+        <mxCell id="208" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="131" target="140" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ReadText Lambda -> NormalizeEvidence (fan-in lower) -->
+        <mxCell id="209" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=1;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="132" target="140" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- NormalizeEvidence -> SynthesizeVerdict -->
+        <mxCell id="210" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="140" target="141" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- SynthesizeVerdict -> Bedrock (InvokeModel, upward) -->
+        <mxCell id="211" value="InvokeModel" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;strokeColor=#8C4FFF;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="141" target="142" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- SynthesizeVerdict -> ApplyGuardrails (main flow continues) -->
+        <mxCell id="212" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="141" target="150" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ApplyGuardrails -> WriteArtifacts -->
+        <mxCell id="213" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#545B64;strokeWidth=1.5;" edge="1" source="150" target="151" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- WriteArtifacts -> S3 Decisions (upper right) -->
+        <mxCell id="214" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#7AA116;strokeWidth=1.5;" edge="1" source="151" target="160" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- WriteArtifacts -> DynamoDB (middle right) -->
+        <mxCell id="215" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#C925D1;strokeWidth=1.5;" edge="1" source="151" target="161" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- WriteArtifacts -> SNS (dashed, conditional NEEDS_REVIEW) -->
+        <mxCell id="216" value="NEEDS_REVIEW" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;dashPattern=8 4;strokeColor=#E7157B;strokeWidth=1.5;fontColor=#232F3E;fontSize=10;" edge="1" source="151" target="162" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

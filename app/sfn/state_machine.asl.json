@@ -1,0 +1,370 @@
+{
+  "Comment": "insurance-claims-ai-pipeline: reads a claim manifest, validates artifacts, fans out per-artifact to Rekognition/Textract/ReadText, normalizes evidence, calls Bedrock for a recommendation, applies guardrails, writes results to S3 and DynamoDB, notifies adjuster if review is required.",
+  "StartAt": "ReadManifest",
+  "States": {
+
+    "ReadManifest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ReadManifestFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "OutputPath": "$.body",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "ValidateArtifactsPresent"
+    },
+
+    "ValidateArtifactsPresent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateArtifactsPresentFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "OutputPath": "$.body",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "ProcessArtifacts"
+    },
+
+    "ProcessArtifacts": {
+      "Type": "Map",
+      "Comment": "Fan out per artifact. Each iteration routes image/document/text to the correct AI service. artifact_results array matches artifacts array order (Map preserves order).",
+      "ItemsPath": "$.artifacts",
+      "ItemSelector": {
+        "artifact.$": "$$.Map.Item.Value"
+      },
+      "MaxConcurrency": 10,
+      "ResultPath": "$.artifact_results",
+      "Iterator": {
+        "StartAt": "ClassifyArtifact",
+        "States": {
+
+          "ClassifyArtifact": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.artifact.type",
+                "StringEquals": "image",
+                "Next": "DetectLabels"
+              },
+              {
+                "Variable": "$.artifact.type",
+                "StringEquals": "document",
+                "Next": "AnalyzeDocument"
+              },
+              {
+                "Variable": "$.artifact.type",
+                "StringEquals": "text",
+                "Next": "ReadText"
+              }
+            ],
+            "Default": "UnknownArtifactType"
+          },
+
+          "DetectLabels": {
+            "Type": "Task",
+            "Comment": "Rekognition DetectLabels via direct AWS SDK integration. No .sync suffix - aws-sdk: integrations are synchronous request/response. Resource: * required - Rekognition DetectLabels has no resource-level ARN.",
+            "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+            "Parameters": {
+              "Image": {
+                "S3Object": {
+                  "Bucket.$": "$.artifact.intake_bucket",
+                  "Name.$": "$.artifact.key"
+                }
+              },
+              "MaxLabels": 30,
+              "MinConfidence": 50
+            },
+            "Comment2": "ResultSelector operates on the Rekognition response (Labels, LabelModelVersion). It cannot access task input fields like artifact.key.",
+            "ResultSelector": {
+              "type": "image",
+              "Labels.$": "$.Labels"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["Rekognition.ProvisionedThroughputExceededException"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          },
+
+          "AnalyzeDocument": {
+            "Type": "Task",
+            "Comment": "Textract AnalyzeDocument via direct AWS SDK integration. SINGLE-PAGE ONLY - Textract sync AnalyzeDocument accepts single-page PDF or PNG only. Multi-page requires async StartDocumentAnalysis (see guide Appendix D). Resource: * required - Textract has NO resource-level permissions at all.",
+            "Resource": "arn:aws:states:::aws-sdk:textract:analyzeDocument",
+            "Parameters": {
+              "Document": {
+                "S3Object": {
+                  "Bucket.$": "$.artifact.intake_bucket",
+                  "Name.$": "$.artifact.key"
+                }
+              },
+              "FeatureTypes": ["FORMS", "TABLES"]
+            },
+            "ResultSelector": {
+              "type": "document",
+              "Blocks.$": "$.Blocks"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["Textract.ProvisionedThroughputExceededException"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          },
+
+          "ReadText": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${ReadTextFunctionArn}",
+              "Payload.$": "$"
+            },
+            "ResultSelector": {
+              "body.$": "$.Payload"
+            },
+            "ResultPath": "$",
+            "OutputPath": "$.body",
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          },
+
+          "UnknownArtifactType": {
+            "Type": "Fail",
+            "Error": "UnknownArtifactType",
+            "Cause": "Artifact type is not image, document, or text. Check manifest validation in ReadManifest Lambda."
+          }
+
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "NormalizeEvidence"
+    },
+
+    "NormalizeEvidence": {
+      "Type": "Task",
+      "Comment": "Combines artifacts (original array with keys) and artifact_results (Map output, same order) into a single evidence dict for Bedrock.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${NormalizeEvidenceFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "OutputPath": "$.body",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "SynthesizeVerdict"
+    },
+
+    "SynthesizeVerdict": {
+      "Type": "Task",
+      "Comment": "Calls Bedrock Claude. All retry logic is in this ASL Retry block - boto3 inside the Lambda is configured with max_attempts=1 so the Lambda makes one attempt and the ASL retries the whole Lambda invocation on failure.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SynthesizeVerdictFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "OutputPath": "$.body",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "Comment": "2->4->8 second backoff handles Bedrock throttling. Total retry budget ~14s, well within the 120s Lambda timeout."
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "ApplyGuardrails"
+    },
+
+    "ApplyGuardrails": {
+      "Type": "Task",
+      "Comment": "Enforces signal-trust rules: low confidence or DENY -> force NEEDS_REVIEW. Original LLM output is preserved for audit.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ApplyGuardrailsFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "OutputPath": "$.body",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "WriteArtifacts"
+    },
+
+    "WriteArtifacts": {
+      "Type": "Task",
+      "Comment": "Writes decision.json, adjuster_email.md, evidence_bundle.json to the decisions S3 bucket and a record to DynamoDB.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WriteArtifactsFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$",
+      "OutputPath": "$.body",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "ShouldNotifyAdjuster"
+    },
+
+    "ShouldNotifyAdjuster": {
+      "Type": "Choice",
+      "Comment": "Send SNS notification only when the claim requires human adjuster review.",
+      "Choices": [
+        {
+          "Variable": "$.requires_adjuster_review",
+          "BooleanEquals": true,
+          "Next": "NotifyAdjuster"
+        }
+      ],
+      "Default": "ClaimProcessed"
+    },
+
+    "NotifyAdjuster": {
+      "Type": "Task",
+      "Comment": "Direct SNS Publish SDK integration - no Lambda needed for a simple notification. States.Format builds the message inline.",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "${AdjusterNotificationsTopicArn}",
+        "Subject.$": "States.Format('Claim {} requires adjuster review - status: {}', $.claim_id, $.final_status)",
+        "Message.$": "States.Format('Claim ID: {}\nClient: {}\nStatus: {}\nDecision artifacts: {}', $.claim_id, $.client_id, $.final_status, $.decision_s3_prefix)"
+      },
+      "ResultPath": null,
+      "Next": "ClaimProcessed"
+    },
+
+    "ClaimProcessed": {
+      "Type": "Succeed",
+      "Comment": "Claim processing complete. Check the decisions S3 bucket and DynamoDB ClaimsDecisions table for results."
+    },
+
+    "RecordFailure": {
+      "Type": "Task",
+      "Comment": "Writes a FAILED tombstone to DynamoDB so failures are queryable by execution name. Uses $$.Execution.Name as claim_id since client_id may not be in scope if the error occurred early in the pipeline.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${ClaimsDecisionsTableName}",
+        "Item": {
+          "client_id": {"S": "PIPELINE_ERROR"},
+          "claim_id": {"S.$": "$$.Execution.Name"},
+          "final_status": {"S": "FAILED"},
+          "error_detail": {"S.$": "States.JsonToString($.error)"},
+          "processed_at": {"S.$": "$$.Execution.StartTime"}
+        }
+      },
+      "ResultPath": null,
+      "Next": "ClaimFailed"
+    },
+
+    "ClaimFailed": {
+      "Type": "Fail",
+      "Error": "ClaimProcessingFailed",
+      "Cause": "An error occurred during claim processing. See DynamoDB ClaimsDecisions table (PK=PIPELINE_ERROR, SK=execution-name) and SFN execution history for details."
+    }
+
+  }
+}

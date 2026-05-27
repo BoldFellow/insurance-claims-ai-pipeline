@@ -1,0 +1,11 @@
+{
+  "schema_version": "1",
+  "client_id": "acme-corp",
+  "claim_id": "CLM-001",
+  "submitted_at": "2026-05-27T12:00:00Z",
+  "artifacts": [
+    {"type": "image",    "key": "clients/acme-corp/CLM-001/photo-damage.jpg"},
+    {"type": "document", "key": "clients/acme-corp/CLM-001/police-report.pdf"},
+    {"type": "text",     "key": "clients/acme-corp/CLM-001/statement.txt"}
+  ]
+}

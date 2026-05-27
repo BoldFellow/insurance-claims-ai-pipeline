@@ -1,0 +1,1022 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  insurance-claims-ai-pipeline: S3 + EventBridge trigger -> Step Functions Standard
+  workflow -> Rekognition + Textract + Bedrock -> DynamoDB + S3 decisions + SNS.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      Bedrock cross-region inference profile ID. Verify this ID is still current
+      in the Bedrock console before deploying -- model and profile IDs change.
+      To use Sonnet, see guide.md S9.
+
+  ConfidenceThreshold:
+    Type: String
+    Default: "0.85"
+    Description: >
+      LLM confidence score below which the recommendation is downgraded to
+      NEEDS_REVIEW. Float as string (0.0 to 1.0).
+
+  AdjusterEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional email address to subscribe to the adjuster SNS topic. Leave
+      blank to skip subscription. You must confirm the subscription email
+      before notifications are delivered.
+
+  ArtifactBucket:
+    Type: String
+    Description: >
+      S3 bucket name where deploy.sh uploads Lambda deployment zip files.
+      Must exist before stack creation. Example: my-deploy-artifacts-123456789012
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasAdjusterEmail: !Not [!Equals [!Ref AdjusterEmail, ""]]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # KMS key -- SSE-KMS for S3 buckets, DynamoDB, and CloudWatch Log Groups
+  # -------------------------------------------------------------------------
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: insurance-claims-ai-pipeline SSE key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  KmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-key"
+      TargetKeyId: !Ref KmsKey
+
+  # -------------------------------------------------------------------------
+  # S3 -- Intake bucket (claim uploads)
+  # -------------------------------------------------------------------------
+  IntakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Deterministic name avoids circular dependency with IAM roles that
+      # reference the bucket ARN. Roles use !Sub with the same formula.
+      BucketName: !Sub "${AWS::StackName}-intake-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+            BucketKeyEnabled: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  IntakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IntakeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt IntakeBucket.Arn
+              - !Sub "${IntakeBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # -------------------------------------------------------------------------
+  # S3 -- Decisions bucket (pipeline outputs)
+  # -------------------------------------------------------------------------
+  DecisionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-decisions-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+            BucketKeyEnabled: true
+
+  DecisionsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DecisionsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DecisionsBucket.Arn
+              - !Sub "${DecisionsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # -------------------------------------------------------------------------
+  # DynamoDB -- ClaimsDecisions table
+  # PK=client_id (S), SK=claim_id (S)
+  # GSI: StatusIndex -- status (S) + processed_at (S)
+  # Note: status has low cardinality (APPROVE/DENY/NEEDS_REVIEW/FAILED).
+  # GSI hot-partition risk in real high-volume workloads; fine for this lab.
+  # -------------------------------------------------------------------------
+  ClaimsDecisionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-ClaimsDecisions"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKey
+      AttributeDefinitions:
+        - AttributeName: client_id
+          AttributeType: S
+        - AttributeName: claim_id
+          AttributeType: S
+        - AttributeName: final_status
+          AttributeType: S
+        - AttributeName: processed_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: client_id
+          KeyType: HASH
+        - AttributeName: claim_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: final_status
+              KeyType: HASH
+            - AttributeName: processed_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # -------------------------------------------------------------------------
+  # SNS -- Adjuster notifications topic
+  # -------------------------------------------------------------------------
+  AdjusterNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-AdjusterNotifications"
+      KmsMasterKeyId: !Ref KmsKey
+
+  AdjusterEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdjusterEmail
+    Properties:
+      TopicArn: !Ref AdjusterNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref AdjusterEmail
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # -------------------------------------------------------------------------
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/${AWS::StackName}-ClaimsStateMachine"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  ReadManifestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ReadManifest"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  ValidateArtifactsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ValidateArtifacts"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  ReadTextLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ReadText"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  NormalizeEvidenceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-NormalizeEvidence"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  SynthesizeVerdictLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-SynthesizeVerdict"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  ApplyGuardrailsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ApplyGuardrails"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  WriteArtifactsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-WriteArtifacts"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  # -------------------------------------------------------------------------
+  # IAM -- Lambda execution roles (one per Lambda, least-privilege)
+  # -------------------------------------------------------------------------
+  ReadManifestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ReadManifestRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadManifestPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KmsKey.Arn
+
+  ValidateArtifactsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ValidateArtifactsRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ValidateArtifactsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KmsKey.Arn
+
+  ReadTextRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ReadTextRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadTextPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KmsKey.Arn
+
+  NormalizeEvidenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-NormalizeEvidenceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  SynthesizeVerdictRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SynthesizeVerdictRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SynthesizeVerdictPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Cross-region inference profile: must grant on BOTH the profile ARN
+              # AND the underlying foundation-model ARNs in every region the profile
+              # spans. Missing any region throws AccessDeniedException at runtime.
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                  - !Sub "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+                  - !Sub "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+                  - !Sub "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+
+  ApplyGuardrailsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ApplyGuardrailsRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  WriteArtifactsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-WriteArtifactsRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WriteArtifactsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-decisions-${AWS::AccountId}/clients/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ClaimsDecisionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KmsKey.Arn
+
+  # -------------------------------------------------------------------------
+  # IAM -- Step Functions execution role
+  # -------------------------------------------------------------------------
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-StateMachineRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Lambda invocations
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ReadManifestFunction.Arn
+                  - !GetAtt ValidateArtifactsFunction.Arn
+                  - !GetAtt ReadTextFunction.Arn
+                  - !GetAtt NormalizeEvidenceFunction.Arn
+                  - !GetAtt SynthesizeVerdictFunction.Arn
+                  - !GetAtt ApplyGuardrailsFunction.Arn
+                  - !GetAtt WriteArtifactsFunction.Arn
+              # Rekognition -- no resource-level ARN for DetectLabels; action is the constraint
+              - Effect: Allow
+                Action: rekognition:DetectLabels
+                Resource: "*"
+              # Textract -- no resource-level permissions at all; Resource: * is required
+              - Effect: Allow
+                Action: textract:AnalyzeDocument
+                Resource: "*"
+              # DynamoDB PutItem for RecordFailure tombstone
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ClaimsDecisionsTable.Arn
+              # SNS Publish for NotifyAdjuster
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AdjusterNotificationsTopic
+              # S3 GetObject for Rekognition/Textract direct integrations (read from intake)
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
+              # KMS for SSE-KMS bucket access
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KmsKey.Arn
+              # CloudWatch Logs for state machine execution logging
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:DescribeResourcePolicies
+                  - logs:GetLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutLogEvents
+                  - logs:PutResourcePolicy
+                  - logs:UpdateLogDelivery
+                Resource: "*"
+              # X-Ray tracing (optional -- remove if X-Ray is not enabled)
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # IAM -- EventBridge execution role
+  # -------------------------------------------------------------------------
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-EventBridgeRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ClaimsStateMachine
+
+  # -------------------------------------------------------------------------
+  # Lambda functions (Python 3.12, ARM64)
+  # -------------------------------------------------------------------------
+  ReadManifestFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ReadManifestLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ReadManifest"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt ReadManifestRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/read_manifest.zip"
+      Environment:
+        Variables:
+          DECISIONS_BUCKET: !Sub "${AWS::StackName}-decisions-${AWS::AccountId}"
+
+  ValidateArtifactsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ValidateArtifactsLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ValidateArtifacts"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt ValidateArtifactsRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/validate_artifacts_present.zip"
+
+  ReadTextFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ReadTextLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ReadText"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt ReadTextRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/read_text.zip"
+
+  NormalizeEvidenceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NormalizeEvidenceLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-NormalizeEvidence"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt NormalizeEvidenceRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/normalize_evidence.zip"
+
+  SynthesizeVerdictFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SynthesizeVerdictLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-SynthesizeVerdict"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt SynthesizeVerdictRole.Arn
+      MemorySize: 512
+      Timeout: 120
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/synthesize_verdict.zip"
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+
+  ApplyGuardrailsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ApplyGuardrailsLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ApplyGuardrails"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt ApplyGuardrailsRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/apply_guardrails.zip"
+      Environment:
+        Variables:
+          CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
+
+  WriteArtifactsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WriteArtifactsLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-WriteArtifacts"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Role: !GetAtt WriteArtifactsRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub "${AWS::StackName}/lambdas/write_artifacts.zip"
+      Environment:
+        Variables:
+          CLAIMS_TABLE: !Sub "${AWS::StackName}-ClaimsDecisions"
+
+  # -------------------------------------------------------------------------
+  # Step Functions -- State machine (ASL inlined via Fn::Sub)
+  # -------------------------------------------------------------------------
+  ClaimsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-ClaimsStateMachine"
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        ReadManifestFunctionArn: !GetAtt ReadManifestFunction.Arn
+        ValidateArtifactsPresentFunctionArn: !GetAtt ValidateArtifactsFunction.Arn
+        ReadTextFunctionArn: !GetAtt ReadTextFunction.Arn
+        NormalizeEvidenceFunctionArn: !GetAtt NormalizeEvidenceFunction.Arn
+        SynthesizeVerdictFunctionArn: !GetAtt SynthesizeVerdictFunction.Arn
+        ApplyGuardrailsFunctionArn: !GetAtt ApplyGuardrailsFunction.Arn
+        WriteArtifactsFunctionArn: !GetAtt WriteArtifactsFunction.Arn
+        AdjusterNotificationsTopicArn: !Ref AdjusterNotificationsTopic
+        ClaimsDecisionsTableName: !Sub "${AWS::StackName}-ClaimsDecisions"
+      DefinitionString: |
+        {
+          "Comment": "insurance-claims-ai-pipeline: reads a claim manifest, validates artifacts, fans out per-artifact to Rekognition/Textract/ReadText, normalizes evidence, calls Bedrock for a recommendation, applies guardrails, writes results to S3 and DynamoDB, notifies adjuster if review is required.",
+          "StartAt": "ReadManifest",
+          "States": {
+            "ReadManifest": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReadManifestFunctionArn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": { "body.$": "$.Payload" },
+              "ResultPath": "$",
+              "OutputPath": "$.body",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                  "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "ValidateArtifactsPresent"
+            },
+            "ValidateArtifactsPresent": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ValidateArtifactsPresentFunctionArn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": { "body.$": "$.Payload" },
+              "ResultPath": "$",
+              "OutputPath": "$.body",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                  "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "ProcessArtifacts"
+            },
+            "ProcessArtifacts": {
+              "Type": "Map",
+              "ItemsPath": "$.artifacts",
+              "ItemSelector": { "artifact.$": "$$.Map.Item.Value" },
+              "MaxConcurrency": 10,
+              "ResultPath": "$.artifact_results",
+              "ItemProcessor": {
+                "ProcessorConfig": { "Mode": "INLINE" },
+                "StartAt": "ClassifyArtifact",
+                "States": {
+                  "ClassifyArtifact": {
+                    "Type": "Choice",
+                    "Choices": [
+                      { "Variable": "$.artifact.type", "StringEquals": "image", "Next": "DetectLabels" },
+                      { "Variable": "$.artifact.type", "StringEquals": "document", "Next": "AnalyzeDocument" },
+                      { "Variable": "$.artifact.type", "StringEquals": "text", "Next": "ReadText" }
+                    ],
+                    "Default": "UnknownArtifactType"
+                  },
+                  "DetectLabels": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+                    "Parameters": {
+                      "Image": {
+                        "S3Object": {
+                          "Bucket.$": "$.artifact.intake_bucket",
+                          "Name.$": "$.artifact.key"
+                        }
+                      },
+                      "MaxLabels": 30,
+                      "MinConfidence": 50
+                    },
+                    "ResultSelector": { "type": "image", "Labels.$": "$.Labels" },
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Rekognition.ProvisionedThroughputExceededException"],
+                        "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                      }
+                    ],
+                    "End": true
+                  },
+                  "AnalyzeDocument": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:textract:analyzeDocument",
+                    "Parameters": {
+                      "Document": {
+                        "S3Object": {
+                          "Bucket.$": "$.artifact.intake_bucket",
+                          "Name.$": "$.artifact.key"
+                        }
+                      },
+                      "FeatureTypes": ["FORMS", "TABLES"]
+                    },
+                    "ResultSelector": { "type": "document", "Blocks.$": "$.Blocks" },
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Textract.ProvisionedThroughputExceededException"],
+                        "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
+                      }
+                    ],
+                    "End": true
+                  },
+                  "ReadText": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${ReadTextFunctionArn}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": { "body.$": "$.Payload" },
+                    "ResultPath": "$",
+                    "OutputPath": "$.body",
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException"],
+                        "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                      }
+                    ],
+                    "End": true
+                  },
+                  "UnknownArtifactType": {
+                    "Type": "Fail",
+                    "Error": "UnknownArtifactType",
+                    "Cause": "Artifact type is not image, document, or text. Check manifest validation in ReadManifest Lambda."
+                  }
+                }
+              },
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "NormalizeEvidence"
+            },
+            "NormalizeEvidence": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NormalizeEvidenceFunctionArn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": { "body.$": "$.Payload" },
+              "ResultPath": "$",
+              "OutputPath": "$.body",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "SynthesizeVerdict"
+            },
+            "SynthesizeVerdict": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SynthesizeVerdictFunctionArn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": { "body.$": "$.Payload" },
+              "ResultPath": "$",
+              "OutputPath": "$.body",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException","States.TaskFailed"],
+                  "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "ApplyGuardrails"
+            },
+            "ApplyGuardrails": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ApplyGuardrailsFunctionArn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": { "body.$": "$.Payload" },
+              "ResultPath": "$",
+              "OutputPath": "$.body",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "WriteArtifacts"
+            },
+            "WriteArtifacts": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${WriteArtifactsFunctionArn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": { "body.$": "$.Payload" },
+              "ResultPath": "$",
+              "OutputPath": "$.body",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "ShouldNotifyAdjuster"
+            },
+            "ShouldNotifyAdjuster": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.requires_adjuster_review", "BooleanEquals": true, "Next": "NotifyAdjuster" }
+              ],
+              "Default": "ClaimProcessed"
+            },
+            "NotifyAdjuster": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+              "Parameters": {
+                "TopicArn": "${AdjusterNotificationsTopicArn}",
+                "Subject.$": "States.Format('Claim {} requires adjuster review - status: {}', $.claim_id, $.final_status)",
+                "Message.$": "States.Format('Claim ID: {}\nClient: {}\nStatus: {}\nDecision artifacts: {}', $.claim_id, $.client_id, $.final_status, $.decision_s3_prefix)"
+              },
+              "ResultPath": null,
+              "Next": "ClaimProcessed"
+            },
+            "ClaimProcessed": {
+              "Type": "Succeed"
+            },
+            "RecordFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${ClaimsDecisionsTableName}",
+                "Item": {
+                  "client_id": { "S": "PIPELINE_ERROR" },
+                  "claim_id": { "S.$": "$$.Execution.Name" },
+                  "final_status": { "S": "FAILED" },
+                  "error_detail": { "S.$": "States.JsonToString($.error)" },
+                  "processed_at": { "S.$": "$$.Execution.StartTime" }
+                }
+              },
+              "ResultPath": null,
+              "Next": "ClaimFailed"
+            },
+            "ClaimFailed": {
+              "Type": "Fail",
+              "Error": "ClaimProcessingFailed",
+              "Cause": "An error occurred during claim processing. See DynamoDB ClaimsDecisions table (PK=PIPELINE_ERROR, SK=execution-name) and SFN execution history for details."
+            }
+          }
+        }
+
+  # -------------------------------------------------------------------------
+  # EventBridge -- fires on manifest.json object created in intake bucket
+  # DependsOn: ClaimsStateMachine avoids the rule referencing a non-existent
+  # state machine ARN during stack creation.
+  # -------------------------------------------------------------------------
+  IntakeManifestRule:
+    Type: AWS::Events::Rule
+    DependsOn: ClaimsStateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-IntakeManifestRule"
+      Description: Triggers Claims state machine when manifest.json is uploaded to intake bucket
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Sub "${AWS::StackName}-intake-${AWS::AccountId}"
+          object:
+            key:
+              - suffix: manifest.json
+      State: ENABLED
+      Targets:
+        - Id: ClaimsStateMachineTarget
+          Arn: !Ref ClaimsStateMachine
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  IntakeBucketName:
+    Description: S3 bucket for claim artifact uploads
+    Value: !Ref IntakeBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-IntakeBucketName"
+
+  DecisionsBucketName:
+    Description: S3 bucket for pipeline decision outputs
+    Value: !Ref DecisionsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DecisionsBucketName"
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref ClaimsStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineArn"
+
+  TableName:
+    Description: DynamoDB ClaimsDecisions table name
+    Value: !Ref ClaimsDecisionsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
+
+  TopicArn:
+    Description: SNS adjuster notifications topic ARN
+    Value: !Ref AdjusterNotificationsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-TopicArn"
+
+  KmsKeyArn:
+    Description: KMS key ARN used for SSE on all resources
+    Value: !GetAtt KmsKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KmsKeyArn"
