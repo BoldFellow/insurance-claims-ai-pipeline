@@ -41,38 +41,50 @@ S3 intake bucket  ->  EventBridge rule  ->  Step Functions Standard Workflow
 ## Prerequisites
 
 - AWS account, us-east-1, with Bedrock model access granted for Claude Haiku 4.5
-- AWS CLI v2, Python 3.10+
-- An S3 bucket for Lambda deployment artifacts
+- AWS CLI v2
 
 See `guide.md S0` for full prerequisites and cost guardrails.
 
 ## Quick start
 
+All Lambda code is embedded inline in `cfn/template.yaml`. No build step required.
+
 ```bash
-# Generate sample files
-python3 scripts/generate-samples.py
+# Create a staging bucket for the CFN template (> 51 KB inline limit)
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+aws s3 mb s3://cfn-templates-${ACCOUNT} --region us-east-1
 
-# Deploy (creates stack + uploads Lambda zips)
-./scripts/deploy.sh \
+# Deploy the stack
+aws cloudformation deploy \
+  --template-file cfn/template.yaml \
   --stack-name insurance-claims-ai-pipeline \
-  --artifact-bucket your-deploy-bucket \
-  --adjuster-email you@example.com
+  --s3-bucket cfn-templates-${ACCOUNT} \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+      BedrockModelId=us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+      AdjusterEmail=you@example.com
 
-# Seed a sample claim (triggers pipeline)
-./scripts/seed-sample-claim.sh acme-corp CLM-001
+# Seed a sample claim (artifacts first, manifest last)
+INTAKE=$(aws cloudformation describe-stacks \
+  --stack-name insurance-claims-ai-pipeline \
+  --query 'Stacks[0].Outputs[?OutputKey==`IntakeBucketName`].OutputValue' \
+  --output text)
 
-# Trigger the guardrail demo
-./scripts/seed-sample-claim.sh acme-corp CLM-002 --red-flag
-
-# Teardown
-./scripts/teardown.sh
+aws s3 cp samples/photo-damage.jpg  s3://${INTAKE}/clients/acme-corp/CLM-001/photo-damage.jpg
+aws s3 cp samples/police-report.pdf s3://${INTAKE}/clients/acme-corp/CLM-001/police-report.pdf
+aws s3 cp samples/statement.txt     s3://${INTAKE}/clients/acme-corp/CLM-001/statement.txt
+aws s3 cp samples/manifest.json     s3://${INTAKE}/clients/acme-corp/CLM-001/manifest.json
 ```
+
+See `guide.md S5` for the red-flag guardrail demo and `guide.md S12` for teardown.
 
 ## Repository layout
 
 ```
 cfn/
   template.yaml              single self-contained CloudFormation stack
+                             (all Lambda code embedded inline via Code.ZipFile)
 app/
   lambdas/
     read_manifest/           validates S3 EventBridge event + manifest schema
@@ -84,13 +96,13 @@ app/
     write_artifacts/         writes decision.json, adjuster_email.md, DynamoDB
   sfn/
     state_machine.asl.json   Step Functions ASL definition
-scripts/
-  deploy.sh
-  teardown.sh
-  seed-sample-claim.sh
-  check-bedrock-access.sh
-  generate-samples.py
-  samples/                   synthetic claim artifacts (normal + red-flag)
+samples/
+  manifest.json              sample claim manifest (normal path)
+  photo-damage.jpg           JPEG placeholder for Rekognition
+  police-report.pdf          single-page synthetic incident report
+  statement.txt              claimant statement
+  red-flag/                  alternate artifacts that trigger the guardrail
+  README.md                  sample file provenance and license notes
 guide.md                     full lab guide S0-S12 + Appendices A-D
 architecture.drawio
 architecture.png

@@ -35,7 +35,6 @@ By the end of the lab you will understand:
 
 ### Tools
 - **AWS CLI v2** -- `aws --version` must show 2.x
-- **Python 3.10+** -- for the generate-samples and deploy build steps
 - **drawio CLI (optional)** -- version 30.0.2+, for exporting architecture.png
   Install: `brew install drawio` (macOS) or see drawio GitHub releases
 
@@ -55,8 +54,7 @@ aws budgets create-budget \
     "Subscribers":[{"SubscriptionType":"EMAIL","Address":"YOUR_EMAIL"}]}]'
 ```
 
-**Do NOT loop `seed-sample-claim.sh` in a shell.** 100 runs = ~$7, mostly Textract.
-The seed script has a 60-second rate-limit guard; bypass only with `CONFIRM=yes`.
+**Do NOT loop claim uploads in a shell.** 100 runs = ~$7, mostly Textract.
 
 ### Bedrock model access
 
@@ -64,7 +62,8 @@ Haiku 4.5 is used by default. Verify the inference profile ID is still current:
 
 1. Open AWS Console -> **Amazon Bedrock** -> **Cross-region inference** -> Inference profiles
 2. Locate the `us.anthropic.claude-haiku-4-5-*` profile. Copy the profile ID.
-3. If it differs from the default in `cfn/template.yaml`, pass `--model-id` to `deploy.sh`.
+3. If it differs from the default in `cfn/template.yaml`, pass it via
+   `--parameter-overrides BedrockModelId=...` when deploying (see S3).
 
 **IMPORTANT**: Model IDs and profile IDs change without deprecation notice. The ID
 in this repo was current at time of writing (2026-05-27) but may have been superseded.
@@ -137,41 +136,64 @@ target region, not the region where the stack is deployed.
 
 ## S3 -- Deploy the stack
 
-**Step 1**: Create an artifact bucket for Lambda zips (if you do not have one):
+All Lambda code is embedded inline in `cfn/template.yaml` via `Code.ZipFile`.
+There is no build step and no separate Lambda packaging -- just upload the template
+and create the stack.
+
+**Step 1**: Verify Bedrock model access before deploying:
+
+```bash
+aws bedrock get-foundation-model \
+  --model-identifier us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+  --region us-east-1 \
+  --query 'modelDetails.modelLifecycle' \
+  --output table
+```
+
+If this returns `AccessDeniedException`, complete S2 before proceeding.
+
+**Step 2**: Create a staging bucket for the template (required -- the template
+exceeds the 51 KB inline limit for `--template-body`):
 
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-aws s3 mb s3://my-deploy-artifacts-${ACCOUNT} --region us-east-1
+aws s3 mb s3://cfn-templates-${ACCOUNT} --region us-east-1
 ```
 
-**Step 2**: Generate sample files:
+**Step 3**: Validate and deploy the stack:
 
 ```bash
-python3 scripts/generate-samples.py
-```
+# Validate template locally first
+aws cloudformation validate-template \
+  --template-body file://cfn/template.yaml \
+  --region us-east-1 \
+  --output text --query Description
 
-This creates `scripts/samples/photo-damage.jpg` and `police-report.pdf`.
-For a meaningful Rekognition demo, replace `photo-damage.jpg` with a real
-vehicle damage photo (CC0 or your own). The placeholder JPEG is valid but
-contains no visual content -- Rekognition will return generic labels.
-
-**Step 3**: Deploy:
-
-```bash
-./scripts/deploy.sh \
+# Deploy (uploads template to S3 automatically, then creates the stack)
+aws cloudformation deploy \
+  --template-file cfn/template.yaml \
   --stack-name insurance-claims-ai-pipeline \
-  --artifact-bucket my-deploy-artifacts-${ACCOUNT} \
-  --adjuster-email you@example.com
+  --s3-bucket cfn-templates-${ACCOUNT} \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+      BedrockModelId=us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+      AdjusterEmail=you@example.com
 ```
 
-The script:
-1. Runs `check-bedrock-access.sh` -- fails fast if model access is not granted
-2. Validates the CloudFormation template
-3. `pip install`s each Lambda's `requirements.txt` into a build directory
-4. Zips and uploads each Lambda to the artifact bucket
-5. Creates (or updates) the CFN stack and waits for completion
+`aws cloudformation deploy` is idempotent -- re-run it to apply any changes to
+`cfn/template.yaml` (Lambda code edits, parameter changes, etc.).
 
-Stack creation takes approximately 3-4 minutes.
+Stack creation takes approximately 3-4 minutes. When complete, print the outputs:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name insurance-claims-ai-pipeline \
+  --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+  --output table
+```
+
+Save `IntakeBucketName` and `DecisionsBucketName` -- you will use them in S5.
 
 ---
 
@@ -203,15 +225,33 @@ Per-run cost breakdown (3 artifacts: 1 image, 1 single-page PDF, 1 text):
 
 ## S5 -- Seed a sample claim
 
+Sample artifacts are in `samples/`. Upload them in two phases: artifacts first,
+manifest last. The EventBridge rule fires on the manifest write -- uploading it
+last ensures all artifacts are present before the state machine starts.
+
 ```bash
-./scripts/seed-sample-claim.sh acme-corp CLM-001
+INTAKE_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name insurance-claims-ai-pipeline \
+  --query 'Stacks[0].Outputs[?OutputKey==`IntakeBucketName`].OutputValue' \
+  --output text)
+
+PREFIX=clients/acme-corp/CLM-001
+
+# Step 1: upload artifacts
+aws s3 cp samples/photo-damage.jpg   s3://${INTAKE_BUCKET}/${PREFIX}/photo-damage.jpg
+aws s3 cp samples/police-report.pdf  s3://${INTAKE_BUCKET}/${PREFIX}/police-report.pdf
+aws s3 cp samples/statement.txt      s3://${INTAKE_BUCKET}/${PREFIX}/statement.txt
+
+# Step 2: upload manifest LAST to trigger the pipeline
+aws s3 cp samples/manifest.json      s3://${INTAKE_BUCKET}/${PREFIX}/manifest.json
 ```
 
-The script uploads `photo-damage.jpg`, `police-report.pdf`, and `statement.txt`
-to `s3://[intake-bucket]/clients/acme-corp/CLM-001/`, then uploads `manifest.json`
-last to trigger the EventBridge rule.
-
 The pipeline starts within about 5 seconds of the manifest upload.
+
+**Note on the sample photo**: `samples/photo-damage.jpg` is a minimal valid JPEG
+placeholder. Rekognition will return only generic labels (it contains no meaningful
+visual content). For a realistic demo, replace it with a CC0-licensed vehicle damage
+photo (e.g., from Wikimedia Commons) and document the source in `samples/README.md`.
 
 ---
 
@@ -283,7 +323,17 @@ The red-flag sample set contains a claimant statement with multiple suspicious s
 - Coverage limit increased 14 days before the incident
 
 ```bash
-./scripts/seed-sample-claim.sh acme-corp CLM-002 --red-flag
+INTAKE_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name insurance-claims-ai-pipeline \
+  --query 'Stacks[0].Outputs[?OutputKey==`IntakeBucketName`].OutputValue' \
+  --output text)
+
+PREFIX=clients/acme-corp/CLM-002
+
+aws s3 cp samples/red-flag/photo-damage.jpg   s3://${INTAKE_BUCKET}/${PREFIX}/photo-damage.jpg
+aws s3 cp samples/red-flag/police-report.pdf  s3://${INTAKE_BUCKET}/${PREFIX}/police-report.pdf
+aws s3 cp samples/red-flag/statement.txt      s3://${INTAKE_BUCKET}/${PREFIX}/statement.txt
+aws s3 cp samples/red-flag/manifest.json      s3://${INTAKE_BUCKET}/${PREFIX}/manifest.json
 ```
 
 After the execution completes, compare CLM-001 and CLM-002 in `evidence_bundle.json`:
@@ -310,8 +360,9 @@ LLMs cannot make negative determinations.
 
 ## S8 -- Modify the prompt
 
-The Bedrock system prompt and output schema live in:
-`app/lambdas/synthesize_verdict/handler.py`
+The Bedrock system prompt and output schema are embedded directly in `cfn/template.yaml`
+in the `SynthesizeVerdictFunction` resource, under `Code.ZipFile`. Search for
+`SYSTEM_PROMPT` to locate it.
 
 Try:
 1. Adding a new field to the output schema (e.g., `"suggested_investigation_steps"`)
@@ -319,11 +370,17 @@ Try:
    fraud analyst")
 3. Requesting a different tone for the draft adjuster email
 
-After editing, redeploy:
+After editing `cfn/template.yaml`, redeploy:
+
 ```bash
-./scripts/deploy.sh \
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+aws cloudformation deploy \
+  --template-file cfn/template.yaml \
   --stack-name insurance-claims-ai-pipeline \
-  --artifact-bucket my-deploy-artifacts-${ACCOUNT}
+  --s3-bucket cfn-templates-${ACCOUNT} \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
 ```
 
 Then re-seed to observe the changed output.
@@ -336,21 +393,24 @@ The `BedrockModelId` parameter controls which model is used. To swap to Sonnet:
 
 1. Find the current Sonnet cross-region inference profile ID in the Bedrock console
    (Bedrock -> Cross-region inference -> Inference profiles)
-2. Redeploy with the new model ID:
+2. Grant Sonnet model access (same steps as S2, selecting the Sonnet model)
+3. Redeploy with the new model ID:
 
 ```bash
-./scripts/deploy.sh \
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+aws cloudformation deploy \
+  --template-file cfn/template.yaml \
   --stack-name insurance-claims-ai-pipeline \
-  --artifact-bucket my-deploy-artifacts-${ACCOUNT} \
-  --model-id us.anthropic.claude-sonnet-4-6-XXXXXXXX-v1:0
+  --s3-bucket cfn-templates-${ACCOUNT} \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides BedrockModelId=us.anthropic.claude-sonnet-4-6-XXXXXXXX-v1:0
 ```
 
 **Cost warning**: Sonnet costs approximately 15-30x more than Haiku per API call.
 With the same 3-artifact sample, expect ~$0.09-0.10/run vs ~$0.07 for Haiku --
 a 30% total increase but 15-30x on the Bedrock line item alone.
-
-You will also need to grant Sonnet model access in the Bedrock console (same steps
-as S2, but for the Sonnet model).
 
 ---
 
@@ -460,13 +520,73 @@ at runtime pointing to the *remote* region -- a notoriously confusing error.
 
 ## S12 -- Teardown
 
+CloudFormation cannot delete S3 buckets that contain objects (or versioned objects).
+Empty both buckets first, then delete the stack.
+
+**Step 1**: Empty the intake bucket (versioned -- must delete all versions and
+delete markers explicitly):
+
 ```bash
-./scripts/teardown.sh --stack-name insurance-claims-ai-pipeline
+INTAKE_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name insurance-claims-ai-pipeline \
+  --query 'Stacks[0].Outputs[?OutputKey==`IntakeBucketName`].OutputValue' \
+  --output text)
+
+# Delete all object versions and delete markers
+aws s3api list-object-versions --bucket "${INTAKE_BUCKET}" \
+  --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+  --output json | \
+  python3 -c "
+import sys, json, subprocess
+data = json.load(sys.stdin)
+objs = data.get('Objects') or []
+if objs:
+    subprocess.run(['aws','s3api','delete-objects',
+        '--bucket','${INTAKE_BUCKET}','--delete',
+        json.dumps({'Objects': objs, 'Quiet': True})], check=True)
+print(f'Deleted {len(objs)} versions')
+"
+
+aws s3api list-object-versions --bucket "${INTAKE_BUCKET}" \
+  --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+  --output json | \
+  python3 -c "
+import sys, json, subprocess
+data = json.load(sys.stdin)
+objs = data.get('Objects') or []
+if objs:
+    subprocess.run(['aws','s3api','delete-objects',
+        '--bucket','${INTAKE_BUCKET}','--delete',
+        json.dumps({'Objects': objs, 'Quiet': True})], check=True)
+print(f'Deleted {len(objs)} delete markers')
+"
 ```
 
-The script:
-1. Empties both S3 buckets (including all versioned objects and delete markers)
-2. Deletes the CloudFormation stack and waits for DELETE_COMPLETE
+**Step 2**: Empty the decisions bucket (same steps, substituting `DecisionsBucketName`):
+
+```bash
+DECISIONS_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name insurance-claims-ai-pipeline \
+  --query 'Stacks[0].Outputs[?OutputKey==`DecisionsBucketName`].OutputValue' \
+  --output text)
+
+# Same list-object-versions + delete-objects pattern as above, with DECISIONS_BUCKET
+aws s3 rm s3://${DECISIONS_BUCKET} --recursive
+```
+
+**Step 3**: Delete the stack:
+
+```bash
+aws cloudformation delete-stack \
+  --stack-name insurance-claims-ai-pipeline \
+  --region us-east-1
+
+aws cloudformation wait stack-delete-complete \
+  --stack-name insurance-claims-ai-pipeline \
+  --region us-east-1
+
+echo "Stack deleted."
+```
 
 Items NOT deleted:
 - **DynamoDB table** (`DeletionPolicy: Retain`) -- delete manually if desired
@@ -533,14 +653,19 @@ Fix:
 1. Check model access in **Bedrock console** for us-east-1, us-east-2, us-west-2
 2. Verify the `SynthesizeVerdictRole` policy covers foundation-model ARNs in all three
    regions (`cfn/template.yaml` -> `SynthesizeVerdictRole`)
-3. Re-run `check-bedrock-access.sh` and confirm exit 0
+3. Verify access via CLI:
+   ```bash
+   aws bedrock list-foundation-models \
+     --query 'modelSummaries[?modelId==`anthropic.claude-haiku-4-5-20251001-v1:0`]' \
+     --output table --region us-east-1
+   ```
 
 ### Textract UnsupportedDocumentException
 
 Cause: The uploaded PDF has more than one page. Textract `AnalyzeDocument` (sync)
 is single-page only.
 
-Fix: Use a single-page PDF. Regenerate with `python3 scripts/generate-samples.py`.
+Fix: Use a single-page PDF. The included `samples/police-report.pdf` is single-page.
 For multi-page support, see Appendix D extension exercise.
 
 ### EventBridge rule not firing
@@ -563,9 +688,9 @@ ran HeadObject on each artifact, some were not yet present.
 
 This is the manifest-last convention's race condition in action (see S1 teaching note).
 
-Fix: Ensure all artifact uploads complete before uploading the manifest. The seed
-script does this correctly. If uploading manually, add a short delay before the
-manifest upload.
+Fix: Ensure all artifact uploads (`aws s3 cp` for photo, PDF, and text) complete
+before uploading `manifest.json`. Follow the two-step upload order in S5 -- artifacts
+first, manifest last.
 
 ### DynamoDB record not appearing
 
@@ -582,7 +707,7 @@ Failed runs are written with `client_id=PIPELINE_ERROR` and `claim_id=<execution
 
 ## Appendix C -- Cleanup verification checklist
 
-After running `teardown.sh`, verify:
+After completing S12 teardown, verify:
 
 - [ ] `aws cloudformation describe-stacks --stack-name insurance-claims-ai-pipeline`
       returns `Stack with id ... does not exist`
@@ -634,7 +759,7 @@ To add Bedrock Guardrails:
 1. Create a guardrail in the Bedrock console with content filters appropriate for
    insurance claim processing
 2. Pass `guardrailIdentifier` and `guardrailVersion` to the `invoke_model` call
-   in `synthesize_verdict/handler.py`
+   in the `SynthesizeVerdictFunction` ZipFile block in `cfn/template.yaml`
 3. Handle `GUARDRAIL_INTERVENED` in the response and set `final_status = NEEDS_REVIEW`
 
 The application-level guardrail in this lab remains valuable for business logic

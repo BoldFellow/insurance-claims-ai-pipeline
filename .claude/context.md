@@ -8,7 +8,7 @@ Textract + Bedrock Claude Haiku -> guardrails -> DynamoDB + S3 + SNS.
 
 ## Stack
 
-- Runtime: Python 3.12 ARM64 Lambda, boto3 pinned >=1.38.0
+- Runtime: Python 3.12 ARM64 Lambda, boto3 from Lambda runtime (no external deps)
 - Orchestration: Step Functions Standard, aws-sdk: direct integrations (NO .sync)
 - AI: Bedrock cross-region inference profile us.anthropic.claude-haiku-4-5-20251001-v1:0
 - CFN: single self-contained template.yaml, us-east-1
@@ -16,16 +16,18 @@ Textract + Bedrock Claude Haiku -> guardrails -> DynamoDB + S3 + SNS.
 
 ## Active Work
 
-All files written. Repo ready to git init and push to GitHub.
+Scripts eliminated. All Lambda code embedded inline in cfn/template.yaml via Code.ZipFile.
+Pipeline validated end-to-end (CLM-001 SUCCEEDED, CLM-002 guardrail fired DENY->NEEDS_REVIEW).
+Ready to commit and push to GitHub.
 
-Files complete:
-- cfn/template.yaml (CFN-validated, ASCII-clean)
+Files:
+- cfn/template.yaml -- all 7 Lambdas inline (Handler: index.handler), no ArtifactBucket param
+- app/lambdas/*/handler.py -- reference copies (canonical code is in cfn/template.yaml ZipFile)
 - app/sfn/state_machine.asl.json
-- app/lambdas/{read_manifest,validate_artifacts_present,read_text,normalize_evidence,
-  synthesize_verdict,apply_guardrails,write_artifacts}/handler.py + requirements.txt
-- scripts/{deploy.sh,teardown.sh,seed-sample-claim.sh,check-bedrock-access.sh,generate-samples.py}
-- scripts/samples/{manifest.json,statement.txt,README.md} + red-flag/ variants
+- samples/{manifest.json,photo-damage.jpg,police-report.pdf,statement.txt,red-flag/,README.md}
 - guide.md, README.md, LICENSE, architecture.drawio, architecture.png
+
+Deleted: scripts/ directory, app/lambdas/*/requirements.txt, build/ directory
 
 ## Key Decisions
 
@@ -44,13 +46,20 @@ Files complete:
   circular dependency between IntakeBucket, StateMachineRole, and IntakeManifestRule.
 
 2026-05-27: DynamoDB DeletionPolicy: Retain -- protects audit records from accidental
-  stack deletion; teardown.sh explicitly notes the table persists.
+  stack deletion; teardown steps note the table persists.
 
 2026-05-27: LLM guardrail framing: "low-trust probabilistic signals require human
   escalation" NOT "LLMs cannot deny". Real adjudication auto-denies at the rules-engine
   layer; this guardrail reflects signal trust profile, not action severity.
 
+2026-05-27: All Lambda code embedded inline via Code.ZipFile; Handler must be index.handler
+  (ZipFile always creates index.py). No ArtifactBucket parameter; deploy uses
+  aws cloudformation deploy --s3-bucket for template-only upload.
+
+2026-05-27: SNS NotifyAdjuster sends full adjuster_email_text (from WriteArtifacts return
+  value) as Message body -- not an S3 path. Files still written to S3 for audit trail.
+
 ## Session Notes
 
-2026-05-27: Full project built in two context windows; all files written, CFN validated,
-  ASCII-clean, architecture PNG exported. Ready for git init and GitHub push.
+2026-05-27: Full project built, CFN validated, ASCII-clean, architecture PNG exported.
+2026-05-27: Pipeline validated end-to-end. SNS sends full email text. Scripts eliminated.

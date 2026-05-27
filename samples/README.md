@@ -55,7 +55,7 @@ for this educational lab. No real personal information is used.
 
 - `statement.txt`: Original fictional narrative. No real persons.
 - `police-report.pdf`: Synthetic. Marked "Synthetic -- for demonstration only".
-- `photo-damage.jpg`: Placeholder JPEG. Replace with a properly licensed image.
+- `photo-damage.jpg`: Public domain. Source: Wikimedia Commons, "Damaged car from hail in Missouri, April 2001". License: Public Domain (pre-1928 US government photo).
 - `red-flag/`: Same terms as above.
 
 ## Regenerating files

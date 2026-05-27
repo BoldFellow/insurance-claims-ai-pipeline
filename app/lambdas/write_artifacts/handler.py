@@ -104,6 +104,7 @@ def handler(event, context):
         "final_status": decision["final_status"],
         "decision_s3_prefix": f"s3://{decisions_bucket}/{prefix}/",
         "requires_adjuster_review": decision["requires_adjuster_review"],
+        "adjuster_email_text": email_md,
     }
 
 

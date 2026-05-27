@@ -31,11 +31,6 @@ Parameters:
       blank to skip subscription. You must confirm the subscription email
       before notifications are delivered.
 
-  ArtifactBucket:
-    Type: String
-    Description: >
-      S3 bucket name where deploy.sh uploads Lambda deployment zip files.
-      Must exist before stack creation. Example: my-deploy-artifacts-123456789012
 
 # ---------------------------------------------------------------------------
 # Conditions
@@ -574,15 +569,113 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-ReadManifest"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt ReadManifestRole.Arn
       MemorySize: 256
       Timeout: 30
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/read_manifest.zip"
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          INTAKE_BUCKET = os.environ["INTAKE_BUCKET"]
+          DECISIONS_BUCKET = os.environ["DECISIONS_BUCKET"]
+
+          s3 = boto3.client("s3")
+
+          VALID_TYPES = {"image", "document", "text"}
+          IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+          DOC_EXTS = {".pdf", ".png"}
+
+
+          class ManifestError(Exception):
+              pass
+
+
+          def handler(event, context):
+              bucket = event["detail"]["bucket"]["name"]
+              key = event["detail"]["object"]["key"]
+
+              response = s3.get_object(Bucket=bucket, Key=key)
+              raw = response["Body"].read()
+              if len(raw) > 100_000:
+                  raise ManifestError("manifest.json exceeds 100 KB size limit")
+
+              try:
+                  manifest = json.loads(raw)
+              except json.JSONDecodeError as e:
+                  raise ManifestError(f"manifest.json is not valid JSON: {e}")
+
+              _validate(manifest, bucket, key)
+
+              for artifact in manifest["artifacts"]:
+                  artifact["intake_bucket"] = INTAKE_BUCKET
+
+              return {
+                  "client_id": manifest["client_id"],
+                  "claim_id": manifest["claim_id"],
+                  "submitted_at": manifest.get("submitted_at", ""),
+                  "intake_bucket": INTAKE_BUCKET,
+                  "decisions_bucket": DECISIONS_BUCKET,
+                  "artifacts": manifest["artifacts"],
+              }
+
+
+          def _validate(manifest, bucket, key):
+              required = ["schema_version", "client_id", "claim_id", "artifacts"]
+              for field in required:
+                  if field not in manifest:
+                      raise ManifestError(f"manifest.json missing required field: {field}")
+
+              if not isinstance(manifest["artifacts"], list):
+                  raise ManifestError("artifacts must be a list")
+
+              if len(manifest["artifacts"]) == 0:
+                  raise ManifestError("artifacts list is empty")
+
+              if len(manifest["artifacts"]) > 20:
+                  raise ManifestError("artifacts list exceeds maximum of 20 items")
+
+              client_id = manifest["client_id"]
+              claim_id = manifest["claim_id"]
+              expected_prefix = f"clients/{client_id}/{claim_id}/"
+
+              for i, artifact in enumerate(manifest["artifacts"]):
+                  if "type" not in artifact:
+                      raise ManifestError(f"artifact[{i}] missing 'type'")
+                  if "key" not in artifact:
+                      raise ManifestError(f"artifact[{i}] missing 'key'")
+
+                  atype = artifact["type"]
+                  akey = artifact["key"]
+
+                  if atype not in VALID_TYPES:
+                      raise ManifestError(
+                          f"artifact[{i}] has invalid type '{atype}'. "
+                          f"Must be one of: {sorted(VALID_TYPES)}"
+                      )
+
+                  if not akey.startswith(expected_prefix):
+                      raise ManifestError(
+                          f"artifact[{i}] key '{akey}' must start with '{expected_prefix}'"
+                      )
+
+                  ext = "." + akey.rsplit(".", 1)[-1].lower() if "." in akey else ""
+                  if atype == "image" and ext not in IMAGE_EXTS:
+                      raise ManifestError(
+                          f"artifact[{i}] is type 'image' but extension is '{ext}'. "
+                          f"Allowed: {sorted(IMAGE_EXTS)}"
+                      )
+                  if atype == "document" and ext not in DOC_EXTS:
+                      raise ManifestError(
+                          f"artifact[{i}] is type 'document' but extension is '{ext}'. "
+                          f"Note: Textract sync requires single-page PDF or PNG. "
+                          f"Allowed: {sorted(DOC_EXTS)}"
+                      )
       Environment:
         Variables:
+          INTAKE_BUCKET: !Sub "${AWS::StackName}-intake-${AWS::AccountId}"
           DECISIONS_BUCKET: !Sub "${AWS::StackName}-decisions-${AWS::AccountId}"
 
   ValidateArtifactsFunction:
@@ -592,13 +685,46 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-ValidateArtifacts"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt ValidateArtifactsRole.Arn
       MemorySize: 256
       Timeout: 30
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/validate_artifacts_present.zip"
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+
+
+          class MissingArtifactError(Exception):
+              pass
+
+
+          def handler(event, context):
+              intake_bucket = event["intake_bucket"]
+              artifacts = event["artifacts"]
+              missing = []
+
+              for artifact in artifacts:
+                  key = artifact["key"]
+                  try:
+                      s3.head_object(Bucket=intake_bucket, Key=key)
+                  except ClientError as e:
+                      code = e.response["Error"]["Code"]
+                      if code in ("404", "NoSuchKey"):
+                          missing.append(key)
+                      else:
+                          raise
+
+              if missing:
+                  raise MissingArtifactError(
+                      f"Manifest lists {len(missing)} artifact(s) not yet present in S3. "
+                      f"Missing keys: {missing}. "
+                      f"Ensure all artifacts are uploaded before dropping manifest.json."
+                  )
+
+              return event
 
   ReadTextFunction:
     Type: AWS::Lambda::Function
@@ -607,13 +733,35 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-ReadText"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt ReadTextRole.Arn
       MemorySize: 256
       Timeout: 30
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/read_text.zip"
+        ZipFile: |
+          import boto3
+
+          s3 = boto3.client("s3")
+          MAX_TEXT_BYTES = 100_000
+
+
+          def handler(event, context):
+              artifact = event["artifact"]
+              intake_bucket = artifact["intake_bucket"]
+              key = artifact["key"]
+
+              response = s3.get_object(Bucket=intake_bucket, Key=key)
+              body = response["Body"].read(MAX_TEXT_BYTES + 1)
+
+              if len(body) > MAX_TEXT_BYTES:
+                  body = body[:MAX_TEXT_BYTES]
+
+              try:
+                  content = body.decode("utf-8")
+              except UnicodeDecodeError:
+                  content = body.decode("utf-8", errors="replace")
+
+              return {"type": "text", "key": key, "content": content}
 
   NormalizeEvidenceFunction:
     Type: AWS::Lambda::Function
@@ -622,13 +770,80 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-NormalizeEvidence"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt NormalizeEvidenceRole.Arn
       MemorySize: 256
       Timeout: 30
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/normalize_evidence.zip"
+        ZipFile: |
+          def handler(event, context):
+              artifacts = event.get("artifacts", [])
+              artifact_results = event.get("artifact_results", [])
+
+              images, documents, texts = [], [], []
+
+              for artifact, result in zip(artifacts, artifact_results):
+                  atype = artifact["type"]
+                  akey = artifact["key"]
+
+                  if atype == "image":
+                      labels = [
+                          {"name": l.get("Name", ""), "confidence": round(l.get("Confidence", 0), 2)}
+                          for l in result.get("Labels", [])[:30]
+                      ]
+                      images.append({"key": akey, "labels": labels})
+
+                  elif atype == "document":
+                      blocks = result.get("Blocks", [])
+                      lines, form_fields = [], []
+                      key_map, value_map = {}, {}
+                      block_index = {b["Id"]: b for b in blocks}
+
+                      for block in blocks:
+                          btype = block.get("BlockType", "")
+                          if btype == "LINE":
+                              lines.append(block.get("Text", ""))
+                          elif btype == "KEY_VALUE_SET":
+                              entity = block.get("EntityTypes", [])
+                              def get_child_text(blk):
+                                  words = []
+                                  for rel in blk.get("Relationships", []):
+                                      if rel["Type"] == "CHILD":
+                                          for cid in rel["Ids"]:
+                                              child = block_index.get(cid, {})
+                                              if child.get("BlockType") == "WORD":
+                                                  words.append(child.get("Text", ""))
+                                  return " ".join(words)
+                              if "KEY" in entity:
+                                  key_text = get_child_text(block)
+                                  for rel in block.get("Relationships", []):
+                                      if rel["Type"] == "VALUE":
+                                          for vid in rel["Ids"]:
+                                              value_map[vid] = key_text
+                                  key_map[block["Id"]] = key_text
+                              elif "VALUE" in entity:
+                                  val_text = get_child_text(block)
+                                  key_text = value_map.get(block["Id"], "")
+                                  if key_text:
+                                      form_fields.append({"key": key_text, "value": val_text})
+
+                      documents.append({
+                          "key": akey,
+                          "extracted_text": "\n".join(lines)[:4000],
+                          "form_fields": form_fields[:50],
+                          "tables": [],
+                      })
+
+                  elif atype == "text":
+                      texts.append({"key": akey, "content": result.get("content", "")[:4000]})
+
+              return {
+                  "client_id": event["client_id"],
+                  "claim_id": event["claim_id"],
+                  "submitted_at": event.get("submitted_at", ""),
+                  "decisions_bucket": event["decisions_bucket"],
+                  "evidence": {"images": images, "documents": documents, "texts": texts},
+              }
 
   SynthesizeVerdictFunction:
     Type: AWS::Lambda::Function
@@ -637,13 +852,126 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-SynthesizeVerdict"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt SynthesizeVerdictRole.Arn
       MemorySize: 512
       Timeout: 120
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/synthesize_verdict.zip"
+        ZipFile: |
+          import json
+          import os
+          import re
+          import boto3
+          from botocore.config import Config
+
+          MODEL_ID = os.environ["BEDROCK_MODEL_ID"]
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+          _config = Config(
+              region_name=REGION,
+              read_timeout=110,
+              connect_timeout=10,
+              retries={"max_attempts": 1},
+          )
+          bedrock = boto3.client("bedrock-runtime", config=_config)
+
+          SYSTEM_PROMPT = (
+              "You are an insurance claims adjudication assistant helping human adjusters "
+              "review claim evidence.\n\n"
+              "IMPORTANT: You are drafting a recommendation for review by a licensed adjuster. "
+              "You are NOT making a final decision. Your output will be validated and may be "
+              "overridden before any action is taken.\n\n"
+              "Analyze the evidence provided and output a JSON object with this exact schema:\n"
+              '{"recommendation":"APPROVE or DENY or NEEDS_REVIEW","confidence":<float 0.0-1.0>,'
+              '"reasoning":"<2-4 sentences>","red_flags":["<list of concerns, empty if none>"],'
+              '"draft_email":"<professional draft email from adjuster to claimant, 3-5 sentences>"}\n\n'
+              "Guidelines:\n"
+              "- APPROVE: evidence is consistent, no red flags, straightforward claim\n"
+              "- DENY: clear evidence of fraud, excluded peril, or policy violation (rare)\n"
+              "- NEEDS_REVIEW: ambiguous evidence, conflicting signals, or anything requiring judgment\n"
+              "- confidence: how certain you are (0.0=no idea, 1.0=completely certain)\n"
+              "- draft_email: written as if from adjuster to claimant (professional, empathetic)\n\n"
+              "Output ONLY the JSON object. No preamble, no explanation outside the JSON."
+          )
+
+
+          def handler(event, context):
+              client_id = event["client_id"]
+              claim_id = event["claim_id"]
+              evidence = event["evidence"]
+
+              parts = [f"Claim ID: {claim_id}\nClient: {client_id}\n\n## Evidence\n"]
+
+              if evidence.get("images"):
+                  parts.append("### Image Analysis (Rekognition)\n")
+                  for img in evidence["images"]:
+                      labels = ", ".join(
+                          f"{l['name']} ({l['confidence']:.0f}%)" for l in img["labels"]
+                      )
+                      parts.append(f"File: {img['key']}\nDetected: {labels}\n\n")
+
+              if evidence.get("documents"):
+                  parts.append("### Document Analysis (Textract)\n")
+                  for doc in evidence["documents"]:
+                      parts.append(f"File: {doc['key']}\n")
+                      if doc["form_fields"]:
+                          fields = "; ".join(
+                              f"{f['key']}: {f['value']}" for f in doc["form_fields"][:20]
+                          )
+                          parts.append(f"Form fields: {fields}\n")
+                      if doc["extracted_text"]:
+                          parts.append(f"Extracted text:\n{doc['extracted_text'][:2000]}\n\n")
+
+              if evidence.get("texts"):
+                  parts.append("### Written Statements\n")
+                  for txt in evidence["texts"]:
+                      parts.append(f"File: {txt['key']}\n{txt['content'][:2000]}\n\n")
+
+              parts.append("\nBased on this evidence, provide your adjudication recommendation as a JSON object.")
+              user_message = "".join(parts)
+
+              body = {
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 1024,
+                  "system": SYSTEM_PROMPT,
+                  "messages": [{"role": "user", "content": user_message}],
+              }
+
+              response = bedrock.invoke_model(
+                  modelId=MODEL_ID,
+                  body=json.dumps(body),
+                  contentType="application/json",
+                  accept="application/json",
+              )
+
+              raw_body = json.loads(response["body"].read())
+              llm_text = raw_body["content"][0]["text"].strip()
+
+              try:
+                  verdict = json.loads(llm_text)
+              except json.JSONDecodeError:
+                  match = re.search(r"\{.*\}", llm_text, re.DOTALL)
+                  if match:
+                      verdict = json.loads(match.group())
+                  else:
+                      raise ValueError(f"Bedrock response is not valid JSON: {llm_text[:500]}")
+
+              required = ["recommendation", "confidence", "reasoning", "red_flags", "draft_email"]
+              for field in required:
+                  if field not in verdict:
+                      raise ValueError(f"Bedrock verdict missing required field: {field}")
+
+              if verdict["recommendation"] not in ("APPROVE", "DENY", "NEEDS_REVIEW"):
+                  raise ValueError(f"Invalid recommendation: {verdict['recommendation']}")
+
+              return {
+                  "client_id": client_id,
+                  "claim_id": claim_id,
+                  "submitted_at": event.get("submitted_at", ""),
+                  "decisions_bucket": event["decisions_bucket"],
+                  "evidence": evidence,
+                  "llm_verdict": verdict,
+              }
       Environment:
         Variables:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
@@ -655,13 +983,56 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-ApplyGuardrails"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt ApplyGuardrailsRole.Arn
       MemorySize: 256
       Timeout: 30
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/apply_guardrails.zip"
+        ZipFile: |
+          import os
+
+          CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.85"))
+
+
+          def handler(event, context):
+              llm_verdict = event["llm_verdict"]
+              recommendation = llm_verdict["recommendation"]
+              confidence = float(llm_verdict["confidence"])
+
+              original_recommendation = recommendation
+              override_reason = None
+
+              if recommendation == "DENY":
+                  override_reason = (
+                      "LLM-derived DENY signals require human review. "
+                      "Deterministic denial (policy lapse, fraud list) must be handled "
+                      "by a rules engine, not an LLM recommendation alone."
+                  )
+                  recommendation = "NEEDS_REVIEW"
+
+              elif confidence < CONFIDENCE_THRESHOLD:
+                  override_reason = (
+                      f"LLM confidence {confidence:.2f} is below threshold {CONFIDENCE_THRESHOLD:.2f}. "
+                      "Low-confidence signals escalate to human review."
+                  )
+                  recommendation = "NEEDS_REVIEW"
+
+              return {
+                  "client_id": event["client_id"],
+                  "claim_id": event["claim_id"],
+                  "submitted_at": event.get("submitted_at", ""),
+                  "decisions_bucket": event["decisions_bucket"],
+                  "evidence": event["evidence"],
+                  "llm_verdict": llm_verdict,
+                  "final_status": recommendation,
+                  "original_recommendation": original_recommendation,
+                  "confidence": confidence,
+                  "override_reason": override_reason,
+                  "reasoning": llm_verdict.get("reasoning", ""),
+                  "red_flags": llm_verdict.get("red_flags", []),
+                  "draft_email": llm_verdict.get("draft_email", ""),
+                  "requires_adjuster_review": recommendation == "NEEDS_REVIEW",
+              }
       Environment:
         Variables:
           CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
@@ -673,16 +1044,126 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-WriteArtifacts"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: handler.handler
+      Handler: index.handler
       Role: !GetAtt WriteArtifactsRole.Arn
       MemorySize: 256
       Timeout: 30
       Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Sub "${AWS::StackName}/lambdas/write_artifacts.zip"
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timezone, timedelta
+          import boto3
+
+          s3 = boto3.client("s3")
+          dynamodb = boto3.client("dynamodb")
+          TABLE_NAME = os.environ["DECISIONS_TABLE_NAME"]
+
+
+          def handler(event, context):
+              client_id = event["client_id"]
+              claim_id = event["claim_id"]
+              decisions_bucket = event["decisions_bucket"]
+              prefix = f"clients/{client_id}/{claim_id}"
+
+              now = datetime.now(timezone.utc)
+              created_at = now.isoformat()
+              ttl = int((now + timedelta(days=90)).timestamp())
+
+              decision = {
+                  "client_id": client_id,
+                  "claim_id": claim_id,
+                  "submitted_at": event.get("submitted_at", ""),
+                  "processed_at": created_at,
+                  "final_status": event["final_status"],
+                  "original_recommendation": event["original_recommendation"],
+                  "confidence": event["confidence"],
+                  "override_reason": event.get("override_reason"),
+                  "reasoning": event["reasoning"],
+                  "red_flags": event["red_flags"],
+                  "requires_adjuster_review": event["requires_adjuster_review"],
+              }
+
+              s3.put_object(
+                  Bucket=decisions_bucket,
+                  Key=f"{prefix}/decision.json",
+                  Body=json.dumps(decision, indent=2).encode(),
+                  ContentType="application/json",
+              )
+
+              draft_email = event.get("draft_email", "")
+              status_line = {
+                  "APPROVE": "Your claim has been reviewed and we are pleased to inform you of a favorable recommendation.",
+                  "DENY": "Your claim has been reviewed. Our adjuster will contact you to discuss the findings.",
+                  "NEEDS_REVIEW": "Your claim requires additional review by one of our adjusters, who will be in touch shortly.",
+              }.get(decision["final_status"], "Your claim is under review.")
+              red_flags_section = ""
+              if decision["red_flags"]:
+                  flags = "\n".join(f"- {f}" for f in decision["red_flags"])
+                  red_flags_section = f"\n\n**Internal Notes (do not send to claimant):**\n{flags}"
+              email_md = (
+                  f"# Draft Adjuster Communication\n"
+                  f"**Claim ID:** {claim_id}\n"
+                  f"**Client:** {client_id}\n"
+                  f"**Processed:** {created_at}\n"
+                  f"**Status:** {decision['final_status']}\n"
+                  f"**Confidence:** {decision['confidence']:.0%}\n\n"
+                  f"> This is a DRAFT generated by the AI pipeline. Review and edit before sending.\n"
+                  f"> Do not send if override_reason is present -- escalate to supervisor first.\n\n"
+                  f"---\n\nDear Claimant,\n\n"
+                  f"{draft_email if draft_email else status_line}\n\n"
+                  f"If you have any questions regarding your claim {claim_id}, please do not hesitate to contact us.\n\n"
+                  f"Sincerely,\n[Adjuster Name]\n[Company Name] Claims Department"
+                  f"{red_flags_section}\n"
+              )
+              s3.put_object(
+                  Bucket=decisions_bucket,
+                  Key=f"{prefix}/adjuster_email.md",
+                  Body=email_md.encode(),
+                  ContentType="text/markdown",
+              )
+
+              bundle = {
+                  "decision": decision,
+                  "llm_verdict": event.get("llm_verdict", {}),
+                  "evidence": event.get("evidence", {}),
+              }
+              s3.put_object(
+                  Bucket=decisions_bucket,
+                  Key=f"{prefix}/evidence_bundle.json",
+                  Body=json.dumps(bundle, indent=2).encode(),
+                  ContentType="application/json",
+              )
+
+              dynamodb.put_item(
+                  TableName=TABLE_NAME,
+                  Item={
+                      "client_id": {"S": client_id},
+                      "claim_id": {"S": claim_id},
+                      "submitted_at": {"S": event.get("submitted_at", "")},
+                      "processed_at": {"S": created_at},
+                      "final_status": {"S": decision["final_status"]},
+                      "original_recommendation": {"S": decision["original_recommendation"]},
+                      "confidence": {"N": str(decision["confidence"])},
+                      "requires_adjuster_review": {"BOOL": decision["requires_adjuster_review"]},
+                      "reasoning": {"S": decision["reasoning"][:1000]},
+                      "red_flags": {"S": json.dumps(decision["red_flags"])},
+                      "decision_s3_prefix": {"S": f"s3://{decisions_bucket}/{prefix}/"},
+                      "ttl": {"N": str(ttl)},
+                  },
+              )
+
+              return {
+                  "client_id": client_id,
+                  "claim_id": claim_id,
+                  "final_status": decision["final_status"],
+                  "decision_s3_prefix": f"s3://{decisions_bucket}/{prefix}/",
+                  "requires_adjuster_review": decision["requires_adjuster_review"],
+                  "adjuster_email_text": email_md,
+              }
       Environment:
         Variables:
-          CLAIMS_TABLE: !Sub "${AWS::StackName}-ClaimsDecisions"
+          DECISIONS_TABLE_NAME: !Sub "${AWS::StackName}-ClaimsDecisions"
 
   # -------------------------------------------------------------------------
   # Step Functions -- State machine (ASL inlined via Fn::Sub)
@@ -919,7 +1400,7 @@ Resources:
               "Parameters": {
                 "TopicArn": "${AdjusterNotificationsTopicArn}",
                 "Subject.$": "States.Format('Claim {} requires adjuster review - status: {}', $.claim_id, $.final_status)",
-                "Message.$": "States.Format('Claim ID: {}\nClient: {}\nStatus: {}\nDecision artifacts: {}', $.claim_id, $.client_id, $.final_status, $.decision_s3_prefix)"
+                "Message.$": "$.adjuster_email_text"
               },
               "ResultPath": null,
               "Next": "ClaimProcessed"
