@@ -331,7 +331,7 @@
       "Parameters": {
         "TopicArn": "${AdjusterNotificationsTopicArn}",
         "Subject.$": "States.Format('Claim {} requires adjuster review - status: {}', $.claim_id, $.final_status)",
-        "Message.$": "States.Format('Claim ID: {}\nClient: {}\nStatus: {}\nDecision artifacts: {}', $.claim_id, $.client_id, $.final_status, $.decision_s3_prefix)"
+        "Message.$": "$.adjuster_email_text"
       },
       "ResultPath": null,
       "Next": "ClaimProcessed"

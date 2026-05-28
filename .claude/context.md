@@ -16,9 +16,16 @@ Textract + Bedrock Claude Haiku -> guardrails -> DynamoDB + S3 + SNS.
 
 ## Active Work
 
-Scripts eliminated. All Lambda code embedded inline in cfn/template.yaml via Code.ZipFile.
-Pipeline validated end-to-end (CLM-001 SUCCEEDED, CLM-002 guardrail fired DENY->NEEDS_REVIEW).
-Ready to commit and push to GitHub.
+Pipeline validated end-to-end and torn down cleanly. guide.md fixed (6 issues). ASL SNS fix applied. Ready to push.
+
+Changes since last session:
+- CLM-001 validated: NEEDS_REVIEW, confidence 0.65, 5 red flags (synthetic PDF marker)
+- CLM-002 validated: NEEDS_REVIEW, confidence 0.25, 9 red flags (guardrail fired correctly)
+- Teardown complete: stack DELETE_COMPLETE, DynamoDB deleted, KMS in PENDING_DELETION
+- DeletionPolicy on DynamoDB changed from Retain to Delete in cfn/template.yaml
+- guide.md: 6 fixes applied (S2 rewrite, S3 model ID fix, validate-template limit note,
+  S7 CLM-001 expected result note, S12 decisions bucket versioned delete, S9 S2 ref removed)
+- Memory saved: CFN always at end as shortcut
 
 Files:
 - cfn/template.yaml -- all 7 Lambdas inline (Handler: index.handler), no ArtifactBucket param
@@ -45,8 +52,8 @@ Deleted: scripts/ directory, app/lambdas/*/requirements.txt, build/ directory
 2026-05-27: Deterministic bucket names (stack-name + account-id suffix) to avoid CFN
   circular dependency between IntakeBucket, StateMachineRole, and IntakeManifestRule.
 
-2026-05-27: DynamoDB DeletionPolicy: Retain -- protects audit records from accidental
-  stack deletion; teardown steps note the table persists.
+2026-05-27: DynamoDB DeletionPolicy changed to Delete -- simplifies teardown and
+  redeploy for a lab context. Retain is called out in S11 as the production pattern.
 
 2026-05-27: LLM guardrail framing: "low-trust probabilistic signals require human
   escalation" NOT "LLMs cannot deny". Real adjudication auto-denies at the rules-engine
@@ -58,8 +65,11 @@ Deleted: scripts/ directory, app/lambdas/*/requirements.txt, build/ directory
 
 2026-05-27: SNS NotifyAdjuster sends full adjuster_email_text (from WriteArtifacts return
   value) as Message body -- not an S3 path. Files still written to S3 for audit trail.
+  cfn/template.yaml was already correct; app/sfn/state_machine.asl.json fixed 2026-05-28.
 
 ## Session Notes
 
 2026-05-27: Full project built, CFN validated, ASCII-clean, architecture PNG exported.
 2026-05-27: Pipeline validated end-to-end. SNS sends full email text. Scripts eliminated.
+2026-05-27: guide.md 6 fixes applied after full lab walkthrough. DynamoDB DeletionPolicy changed to Delete.
+2026-05-28: ASL reference copy fixed -- NotifyAdjuster now sends adjuster_email_text (was States.Format short string). cfn/template.yaml was already correct.

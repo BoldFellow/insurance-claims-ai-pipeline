@@ -112,17 +112,25 @@ Key architectural decisions:
 
 ---
 
-## S2 -- Enable Bedrock model access
+## S2 -- Bedrock model availability
 
-Bedrock model access is per-region and must be granted before the pipeline can invoke
-the model.
+**The Bedrock Model access page has been retired by AWS.** Anthropic foundation models
+(including Haiku 4.5) are now automatically enabled in all commercial AWS regions on
+first invocation. You do not need to manually grant model access.
 
-1. Open the AWS Console in **us-east-1**
-2. Navigate to **Amazon Bedrock** -> **Model access** (left sidebar)
-3. Click **Modify model access**
-4. Find **Anthropic -> Claude Haiku 4.5** and check the box
-5. Click **Request model access** -> **Submit**
-6. Wait for status to show **Access granted** (usually immediate for Haiku)
+If you navigate to Amazon Bedrock in the console you may see a simplified access page
+or no model access section at all -- this is expected. The models are available.
+
+To confirm the model is available in your account:
+
+```bash
+aws bedrock list-foundation-models \
+  --query 'modelSummaries[?contains(modelId,`claude-haiku-4-5`)].{id:modelId,status:modelLifecycleStatus}' \
+  --output table --region us-east-1
+```
+
+This should return at least one row with `ACTIVE` status. If the command returns nothing
+or the model shows `LEGACY`, check the Bedrock console for any account-level restrictions.
 
 Why cross-region inference profiles need multi-region IAM:
 The `us.anthropic.claude-haiku-4-5-*` profile is a *cross-region inference profile*.
@@ -140,17 +148,28 @@ All Lambda code is embedded inline in `cfn/template.yaml` via `Code.ZipFile`.
 There is no build step and no separate Lambda packaging -- just upload the template
 and create the stack.
 
-**Step 1**: Verify Bedrock model access before deploying:
+**Step 1**: Verify the foundation model is available in your account:
 
 ```bash
 aws bedrock get-foundation-model \
-  --model-identifier us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+  --model-identifier anthropic.claude-haiku-4-5-20251001-v1:0 \
   --region us-east-1 \
   --query 'modelDetails.modelLifecycle' \
   --output table
 ```
 
-If this returns `AccessDeniedException`, complete S2 before proceeding.
+Note: use the foundation model ID (`anthropic.claude-haiku-4-5-...`, no `us.` prefix)
+not the inference profile ID. The cross-region profile ID (`us.anthropic...`) is used
+at runtime in the `BedrockModelId` parameter, but `get-foundation-model` requires the
+underlying foundation model ID.
+
+If this returns `ResourceNotFoundException`, the model ID may have changed. Look up the
+current Haiku foundation model ID:
+```bash
+aws bedrock list-foundation-models \
+  --query 'modelSummaries[?contains(modelId,`claude-haiku`)].modelId' \
+  --output table --region us-east-1
+```
 
 **Step 2**: Create a staging bucket for the template (required -- the template
 exceeds the 51 KB inline limit for `--template-body`):
@@ -160,16 +179,14 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 aws s3 mb s3://cfn-templates-${ACCOUNT} --region us-east-1
 ```
 
-**Step 3**: Validate and deploy the stack:
+**Step 3**: Deploy the stack:
 
 ```bash
-# Validate template locally first
-aws cloudformation validate-template \
-  --template-body file://cfn/template.yaml \
-  --region us-east-1 \
-  --output text --query Description
+# NOTE: aws cloudformation validate-template --template-body has a 51 KB limit.
+# This template is ~60 KB. Skip the local validate step -- aws cloudformation deploy
+# validates the template automatically after uploading it to S3.
 
-# Deploy (uploads template to S3 automatically, then creates the stack)
+# Deploy (uploads template to S3 automatically, validates, then creates the stack)
 aws cloudformation deploy \
   --template-file cfn/template.yaml \
   --stack-name insurance-claims-ai-pipeline \
@@ -288,6 +305,16 @@ aws stepfunctions list-executions \
 
 ### Inspect happy path (CLM-001)
 
+**Expected result**: CLM-001 will produce `final_status=NEEDS_REVIEW`, not `APPROVE`.
+The sample `police-report.pdf` contains text identifying it as a synthetic/demo document.
+The LLM correctly flags this as a suspicious marker, resulting in a confidence score
+below the 0.85 threshold. This is expected behavior -- the guardrail fires because the
+signal confidence is low, not because the claim is fraudulent.
+
+The teaching value of CLM-001 is observing the full pipeline run, the evidence bundle,
+and the draft adjuster email. The CLM-002 red-flag contrast (confidence ~0.25 vs ~0.65,
+9 flags vs 5 flags) is where the guardrail behavior is most instructive.
+
 ```bash
 DECISIONS_BUCKET=$(aws cloudformation describe-stacks \
   --stack-name insurance-claims-ai-pipeline \
@@ -393,7 +420,13 @@ The `BedrockModelId` parameter controls which model is used. To swap to Sonnet:
 
 1. Find the current Sonnet cross-region inference profile ID in the Bedrock console
    (Bedrock -> Cross-region inference -> Inference profiles)
-2. Grant Sonnet model access (same steps as S2, selecting the Sonnet model)
+2. Sonnet is auto-enabled in your account (same as Haiku -- no manual access grant
+   needed). Verify the model is available if you want to confirm first:
+   ```bash
+   aws bedrock list-foundation-models \
+     --query 'modelSummaries[?contains(modelId,`claude-sonnet`)].modelId' \
+     --output table --region us-east-1
+   ```
 3. Redeploy with the new model ID:
 
 ```bash
@@ -513,8 +546,9 @@ at runtime pointing to the *remote* region -- a notoriously confusing error.
 - **TLS-only bucket policies** (`aws:SecureTransport` Deny on HTTP)
 - **One IAM role per Lambda** -- WriteArtifacts cannot read the intake bucket;
   ReadManifest cannot write to decisions
-- **DeletionPolicy: Retain** on the DynamoDB table -- protects audit records from
-  accidental stack deletion
+- **DeletionPolicy: Delete** on the DynamoDB table -- table is deleted with the stack
+  for clean teardown in this lab. In production, you would use `Retain` to protect
+  audit records from accidental stack deletion.
 
 ---
 
@@ -562,7 +596,9 @@ print(f'Deleted {len(objs)} delete markers')
 "
 ```
 
-**Step 2**: Empty the decisions bucket (same steps, substituting `DecisionsBucketName`):
+**Step 2**: Empty the decisions bucket (also versioned -- `aws s3 rm --recursive` is NOT
+sufficient because it only adds delete markers; the underlying versions remain and block
+stack deletion):
 
 ```bash
 DECISIONS_BUCKET=$(aws cloudformation describe-stacks \
@@ -570,8 +606,26 @@ DECISIONS_BUCKET=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`DecisionsBucketName`].OutputValue' \
   --output text)
 
-# Same list-object-versions + delete-objects pattern as above, with DECISIONS_BUCKET
-aws s3 rm s3://${DECISIONS_BUCKET} --recursive
+aws s3api list-object-versions --bucket "${DECISIONS_BUCKET}" \
+  --query '[Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}]' \
+  --output json | python3 -c "
+import json, sys, subprocess, tempfile, os
+data = json.load(sys.stdin)
+objects = (data[0] or []) + (data[1] or [])
+if not objects:
+    print('Decisions bucket already empty')
+else:
+    batch = {'Objects': [{'Key': o['Key'], 'VersionId': o['VersionId']} for o in objects], 'Quiet': True}
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(batch, f)
+        fname = f.name
+    import os as _os
+    subprocess.run(['aws', 's3api', 'delete-objects',
+        '--bucket', '${DECISIONS_BUCKET}', '--region', 'us-east-1',
+        '--delete', f'file://{fname}'], check=True)
+    _os.unlink(fname)
+    print(f'Deleted {len(objects)} versions/markers from decisions bucket')
+"
 ```
 
 **Step 3**: Delete the stack:
@@ -588,8 +642,7 @@ aws cloudformation wait stack-delete-complete \
 echo "Stack deleted."
 ```
 
-Items NOT deleted:
-- **DynamoDB table** (`DeletionPolicy: Retain`) -- delete manually if desired
+Items NOT deleted by the stack:
 - **KMS key** -- enters PENDING_DELETION (30-day waiting period by default)
 
 Verify cleanup:
@@ -650,14 +703,16 @@ Cause: The cross-region inference profile routed the request to a region where e
 model access is not granted or the IAM policy does not cover the foundation-model ARN.
 
 Fix:
-1. Check model access in **Bedrock console** for us-east-1, us-east-2, us-west-2
-2. Verify the `SynthesizeVerdictRole` policy covers foundation-model ARNs in all three
-   regions (`cfn/template.yaml` -> `SynthesizeVerdictRole`)
-3. Verify access via CLI:
+1. Models are auto-enabled; this error almost always indicates a missing IAM permission,
+   not a model access issue. The error message will name the specific region that rejected
+   the call (e.g., `us-east-2`).
+2. Verify the `SynthesizeVerdictRole` policy in `cfn/template.yaml` covers
+   foundation-model ARNs in us-east-1, us-east-2, AND us-west-2.
+3. Check model availability for the specific region mentioned in the error:
    ```bash
    aws bedrock list-foundation-models \
-     --query 'modelSummaries[?modelId==`anthropic.claude-haiku-4-5-20251001-v1:0`]' \
-     --output table --region us-east-1
+     --query 'modelSummaries[?modelId==`anthropic.claude-haiku-4-5-20251001-v1:0`].{id:modelId,status:modelLifecycleStatus}' \
+     --output table --region us-east-2
    ```
 
 ### Textract UnsupportedDocumentException
@@ -721,10 +776,6 @@ After completing S12 teardown, verify:
 
 Manual cleanup if needed:
 ```bash
-# DynamoDB (retained by DeletionPolicy)
-aws dynamodb delete-table \
-  --table-name insurance-claims-ai-pipeline-ClaimsDecisions
-
 # Orphan log groups (if any)
 aws logs delete-log-group \
   --log-group-name /aws/lambda/insurance-claims-ai-pipeline-SynthesizeVerdict

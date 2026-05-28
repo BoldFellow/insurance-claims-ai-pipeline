@@ -173,7 +173,7 @@ Resources:
   # -------------------------------------------------------------------------
   ClaimsDecisionsTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Retain
+    DeletionPolicy: Delete
     Properties:
       TableName: !Sub "${AWS::StackName}-ClaimsDecisions"
       BillingMode: PAY_PER_REQUEST
