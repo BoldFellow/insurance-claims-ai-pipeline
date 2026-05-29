@@ -9,19 +9,16 @@ workflow that:
 1. Reads and validates the claim manifest
 2. Confirms all declared artifacts exist in S3 (Map state with HeadObject -- no Lambda)
 3. Fans out per-artifact in parallel: Rekognition for photos, Textract for documents,
-   a Lambda reader for written statements (direct SDK integrations in the Map state)
+   a Lambda reader for written statements that also runs Comprehend sentiment analysis
+   and key-phrase extraction (direct SDK integrations in the Map state)
 4. Assembles the evidence into a single dict (Pass state -- no Lambda)
-5. Calls Bedrock Claude to synthesize a dual-output recommendation: a claimant-safe
-   letter body AND an internal adjuster summary
-6. Runs Amazon Comprehend on the written statement (sentiment + key phrases) and
-   enriches the evidence bundle before calling Bedrock
-7. Synthesizes a dual-output recommendation via Bedrock Claude: a claimant-safe
-   letter body AND an internal adjuster summary
-8. Applies deterministic guardrails via a Choice state: confidence < 0.85
+5. Calls Bedrock Claude to synthesize a dual-output recommendation enriched with
+   Comprehend output: a claimant-safe letter body AND an internal adjuster summary
+6. Applies deterministic guardrails via a Choice state: confidence < 0.85
    -> NEEDS_REVIEW (no Lambda needed)
-9. Persists four decision artifacts to S3 and a record to DynamoDB
-10. Sends a direct SES email to the claimant for APPROVE/DENY; routes to the adjuster
-    SNS topic for NEEDS_REVIEW
+7. Persists four decision artifacts to S3 and a record to DynamoDB
+8. Sends a direct SES email to the claimant for APPROVE/DENY; routes to the adjuster
+   SNS topic for NEEDS_REVIEW
 
 By the end of the lab you will understand:
 - Step Functions Map state fan-out and direct AWS SDK integrations
@@ -125,7 +122,8 @@ service directly, with the state machine role as the IAM principal. No `.sync` s
 -- these integrations are synchronous request/response.
 
 **ASL-native guardrail**: GuardrailCheck is a Choice state, not a Lambda. It routes
-on `$.llm_verdict.recommendation == "DENY"` OR `$.llm_verdict.confidence < 0.85`.
+on `$.llm_verdict.confidence < 0.85` to force NEEDS_REVIEW regardless of the LLM's
+recommendation. High-confidence DENY passes through to NotifyClaimantDenied.
 No code required -- the logic lives in the state machine definition.
 
 **Dual output**: The LLM generates two separate artifacts in one call: a
@@ -397,10 +395,17 @@ Inline policy name: `ReadTextPolicy`
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::insurance-claims-ai-pipeline-intake-<ACCOUNT-ID>/clients/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["comprehend:DetectSentiment", "comprehend:DetectKeyPhrases"],
+      "Resource": "*"
     }
   ]
 }
 ```
+
+Note: Comprehend `detect_*` actions do not support resource-level policies -- `Resource: "*"` is required.
 
 Role name: `insurance-claims-ai-pipeline-ReadTextRole`
 
@@ -793,7 +798,10 @@ Map state only when `artifact.type == "text"`.
 import boto3
 
 s3 = boto3.client("s3")
+comprehend = boto3.client("comprehend")
+
 MAX_TEXT_BYTES = 100_000
+MAX_COMPREHEND_BYTES = 5_000
 
 
 def lambda_handler(event, context):
@@ -812,10 +820,30 @@ def lambda_handler(event, context):
     except UnicodeDecodeError:
         content = body.decode("utf-8", errors="replace")
 
+    comprehend_input = content[:MAX_COMPREHEND_BYTES]
+
+    sentiment_response = comprehend.detect_sentiment(
+        Text=comprehend_input,
+        LanguageCode="en",
+    )
+
+    phrases_response = comprehend.detect_key_phrases(
+        Text=comprehend_input,
+        LanguageCode="en",
+    )
+
+    top_phrases = [
+        p["Text"]
+        for p in sorted(phrases_response["KeyPhrases"], key=lambda x: x["Score"], reverse=True)[:10]
+    ]
+
     return {
         "type": "text",
         "key": key,
         "content": content,
+        "sentiment": sentiment_response["Sentiment"],
+        "sentiment_scores": sentiment_response["SentimentScore"],
+        "key_phrases": top_phrases,
     }
 ```
 
@@ -1008,7 +1036,15 @@ def _build_evidence_message(client_id, claim_id, evidence):
 
         elif atype == "text":
             content = analysis.get("content", "")
-            parts.append(f"### Written Statement: {akey}\n{content[:2000]}\n\n")
+            sentiment = analysis.get("sentiment", "")
+            key_phrases = analysis.get("key_phrases", [])
+            phrases_str = ", ".join(key_phrases) if key_phrases else "none"
+            parts.append(
+                f"### Written Statement: {akey}\n"
+                f"Comprehend sentiment: {sentiment}\n"
+                f"Key phrases: {phrases_str}\n\n"
+                f"{content[:2000]}\n\n"
+            )
 
     parts.append("\nBased on this evidence, provide your adjudication recommendation as a JSON object.")
     return "".join(parts)
@@ -2028,7 +2064,10 @@ change this value directly in the definition to experiment with different thresh
             "ResultSelector": {
               "type.$": "$.Payload.type",
               "key.$": "$.Payload.key",
-              "content.$": "$.Payload.content"
+              "content.$": "$.Payload.content",
+              "sentiment.$": "$.Payload.sentiment",
+              "sentiment_scores.$": "$.Payload.sentiment_scores",
+              "key_phrases.$": "$.Payload.key_phrases"
             },
             "ResultPath": "$.analysis",
             "Retry": [
@@ -2116,16 +2155,8 @@ change this value directly in the definition to experiment with different thresh
       "Comment": "Downgrades to NEEDS_REVIEW if confidence is below 0.85 (low-trust signal). High-confidence DENY passes through to RouteDecision. ASL Choice -- no Lambda needed.",
       "Choices": [
         {
-          "Or": [
-            {
-              "Variable": "$.llm_verdict.recommendation",
-              "StringEquals": "DENY"
-            },
-            {
-              "Variable": "$.llm_verdict.confidence",
-              "NumericLessThan": 0.85
-            }
-          ],
+          "Variable": "$.llm_verdict.confidence",
+          "NumericLessThan": 0.85,
           "Next": "ForceNeedsReview"
         }
       ],
@@ -2328,7 +2359,7 @@ State Machine ARN: _______________________________________
 | Read text file | Lambda | S3 GetObject + UTF-8 decode + length guard |
 | Assemble evidence dict | ASL (Pass) | Pure data reshape via intrinsic functions |
 | Bedrock invocation | Lambda | Prompt construction + JSON parse + validation |
-| Guardrail routing | ASL (Choice + Pass) | Binary condition on two fields -- no code |
+| Guardrail routing | ASL (Choice + Pass) | Confidence threshold check -- no code |
 | Write 4 S3 files + DDB | Lambda | Multi-step write with formatting logic |
 | SNS publish | ASL (aws-sdk) | Single API call, no transform |
 
@@ -2442,7 +2473,7 @@ What to observe in the visual workflow:
 
 - **SynthesizeVerdict**: expect 5-15 seconds for Haiku to respond.
 
-- **GuardrailCheck**: a Choice state that routes based on two fields. No Lambda needed.
+- **GuardrailCheck**: a Choice state that routes on confidence < 0.85. No Lambda needed.
 
 - **RouteDecision**: the final Choice state -- three branches, three distinct
   Succeed terminal states.
@@ -2963,7 +2994,7 @@ Per run (3 artifacts: 1 JPEG, 1 single-page PDF, 1 text), Haiku 4.5:
 | Lambda | 4 invocations, 256-512 MB, < 5s each | < $0.001 |
 | DynamoDB on-demand | 1 PutItem | < $0.001 |
 | S3 | GetObject reads + 4 PutObject writes | < $0.001 |
-| SNS | 1 Publish | < $0.001 |
+| SES / SNS | 1 email (APPROVE/DENY) or 1 SNS publish (NEEDS_REVIEW) | < $0.001 |
 | **Total** | | **~$0.07/run** |
 
 Per run, Sonnet swap (S15):
@@ -3104,7 +3135,7 @@ To add Bedrock Guardrails:
 3. Handle `GUARDRAIL_INTERVENED` in the response and set `final_status = NEEDS_REVIEW`
 
 The ASL-level guardrail in this lab remains valuable for business logic (confidence
-threshold, DENY escalation) even when Bedrock Guardrails handles content filtering.
+threshold enforcement) even when Bedrock Guardrails handles content filtering.
 
 ### E3 -- Human-in-the-loop adjuster approval
 
