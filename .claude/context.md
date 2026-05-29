@@ -167,8 +167,8 @@ Completed:
 
 ## Session Notes
 
-2026-05-29: Comprehend added to ReadText Lambda; GuardrailCheck fixed; samples/deny/ added (CLM-003); NEEDS_REVIEW optimization complete.
 2026-05-29: CFN validated via S3; diagram updated (Comprehend icon, corrected labels).
 2026-05-29: samples/approve/ subfolder created; CLM-001 files moved out of samples/ root.
 2026-05-29: ClaimantNotifications SNS replaced with SES v2 sendEmail. SenderEmail + ClaimantEmail required CFN parameters.
 2026-05-29: Deployed stack, tested APPROVE+DENY end-to-end. Fixed handler name mismatch (handler->lambda_handler) and empty DENY client_letter (SYSTEM_PROMPT + fallback). Both paths SUCCEEDED with SES email delivery.
+2026-05-29: Full guide.md review complete. Fixed 9 stale references: Comprehend in ReadText code listing, ReadTextRole IAM (missing comprehend:Detect*), ASL ReadText ResultSelector (missing 3 Comprehend fields), GuardrailCheck in overview/paste block/teaching notes/S12 (stale DENY intercept), SynthesizeVerdict text branch, cost table (SES/SNS), E2 (stale DENY escalation mention).
