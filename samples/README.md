@@ -21,7 +21,7 @@ Use this set first to verify the happy path end-to-end.
 Expected outcome:
 - `final_status=APPROVE` with `confidence >= 0.85`
 - `client_letter.txt` contains approval language (no red flags, no internal reasoning)
-- SNS publish to ClaimantNotificationsTopic only
+- SES email sent to claimant; adjuster is not notified
 
 ## red-flag/ (CLM-002)
 
@@ -47,7 +47,7 @@ Bedrock, which passes through the GuardrailCheck and routes to NotifyClaimantDen
 Expected outcome:
 - `final_status=DENY` with `confidence >= 0.85`
 - `client_letter.txt` contains denial reasons and appeal instructions
-- SNS publish to ClaimantNotificationsTopic only (adjuster is not notified)
+- SES email sent to claimant; adjuster is not notified
 
 ## Photo requirements
 
@@ -89,6 +89,5 @@ for this educational lab. No real personal information is used.
 
 ## Regenerating files
 
-```bash
-python3 scripts/generate-samples.py
-```
+Sample files are hand-crafted for this lab. To replace `photo-damage.jpg` with a
+real vehicle photograph, see the Photo requirements section above.

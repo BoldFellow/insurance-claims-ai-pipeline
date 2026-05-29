@@ -69,7 +69,7 @@ aws s3 cp samples/approve/manifest.json s3://${INTAKE}/clients/acme-corp/CLM-001
 ```
 
 See `guide.md S5` for the NEEDS_REVIEW guardrail demo, `guide.md S6` for the DENY
-path, and `guide.md S12` for teardown.
+path, and `guide.md S18` for teardown.
 
 ## Three sample claim sets
 

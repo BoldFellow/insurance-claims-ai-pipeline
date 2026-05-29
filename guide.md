@@ -2892,10 +2892,10 @@ INTAKE_BUCKET=$(aws cloudformation describe-stacks \
 
 PREFIX=clients/acme-corp/CLM-001
 
-aws s3 cp samples/photo-damage.jpg   s3://${INTAKE_BUCKET}/${PREFIX}/photo-damage.jpg   --region ${REGION}
-aws s3 cp samples/police-report.pdf  s3://${INTAKE_BUCKET}/${PREFIX}/police-report.pdf  --region ${REGION}
-aws s3 cp samples/statement.txt      s3://${INTAKE_BUCKET}/${PREFIX}/statement.txt      --region ${REGION}
-aws s3 cp samples/manifest.json      s3://${INTAKE_BUCKET}/${PREFIX}/manifest.json      --region ${REGION}
+aws s3 cp samples/approve/photo-damage.jpg   s3://${INTAKE_BUCKET}/${PREFIX}/photo-damage.jpg   --region ${REGION}
+aws s3 cp samples/approve/police-report.pdf  s3://${INTAKE_BUCKET}/${PREFIX}/police-report.pdf  --region ${REGION}
+aws s3 cp samples/approve/statement.txt      s3://${INTAKE_BUCKET}/${PREFIX}/statement.txt      --region ${REGION}
+aws s3 cp samples/approve/manifest.json      s3://${INTAKE_BUCKET}/${PREFIX}/manifest.json      --region ${REGION}
 ```
 
 ### CFN teardown
@@ -3003,7 +3003,7 @@ The `*` wildcard on region is required. Do not replace it with a region list.
 Cause: The uploaded PDF has more than one page. Textract `AnalyzeDocument` (sync)
 is single-page only.
 
-Fix: Use a single-page PDF. The included `samples/police-report.pdf` is single-page.
+Fix: Use a single-page PDF. The included `samples/approve/police-report.pdf` is single-page.
 For multi-page support, see Appendix E, extension E1.
 
 ### EventBridge invocation failed
