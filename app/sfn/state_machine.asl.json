@@ -1,5 +1,5 @@
 {
-  "Comment": "insurance-claims-ai-pipeline: reads a claim manifest, validates artifacts, fans out per-artifact to Rekognition/Textract/ReadText, normalizes evidence, calls Bedrock for a recommendation, applies guardrails, writes results to S3 and DynamoDB, notifies adjuster if review is required.",
+  "Comment": "insurance-claims-ai-pipeline: 4-Lambda design. ReadManifest -> ValidateArtifacts (Map/HeadObject) -> ProcessArtifacts (Map/Rekognition+Textract+ReadText) -> BuildEvidence (Pass) -> SynthesizeVerdict (Bedrock) -> GuardrailCheck (Choice) -> WriteArtifacts (S3+DDB) -> RouteDecision (SES claimant email + SNS adjuster topic).",
   "StartAt": "ReadManifest",
   "States": {
 
@@ -30,29 +30,36 @@
           "Next": "RecordFailure"
         }
       ],
-      "Next": "ValidateArtifactsPresent"
+      "Next": "ValidateArtifacts"
     },
 
-    "ValidateArtifactsPresent": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "${ValidateArtifactsPresentFunctionArn}",
-        "Payload.$": "$"
+    "ValidateArtifacts": {
+      "Type": "Map",
+      "Comment": "HeadObject each artifact declared in the manifest. Any 404 fails the Map -> RecordFailure. ResultPath: null discards Map output and passes the full input state downstream unchanged.",
+      "ItemsPath": "$.artifacts",
+      "ItemSelector": {
+        "artifact.$": "$$.Map.Item.Value"
       },
-      "ResultSelector": {
-        "body.$": "$.Payload"
-      },
-      "ResultPath": "$",
-      "OutputPath": "$.body",
-      "Retry": [
-        {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2.0
+      "MaxConcurrency": 10,
+      "ResultPath": null,
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "HeadObject",
+        "States": {
+          "HeadObject": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+            "Parameters": {
+              "Bucket.$": "$.artifact.intake_bucket",
+              "Key.$": "$.artifact.key"
+            },
+            "ResultPath": null,
+            "End": true
+          }
         }
-      ],
+      },
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -65,14 +72,17 @@
 
     "ProcessArtifacts": {
       "Type": "Map",
-      "Comment": "Fan out per artifact. Each iteration routes image/document/text to the correct AI service. artifact_results array matches artifacts array order (Map preserves order).",
+      "Comment": "Fan out per artifact. Each iteration routes by type and stores service output at $.analysis. Map output: array of {artifact, analysis} objects placed at $.artifact_results.",
       "ItemsPath": "$.artifacts",
       "ItemSelector": {
         "artifact.$": "$$.Map.Item.Value"
       },
       "MaxConcurrency": 10,
       "ResultPath": "$.artifact_results",
-      "Iterator": {
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
         "StartAt": "ClassifyArtifact",
         "States": {
 
@@ -100,7 +110,7 @@
 
           "DetectLabels": {
             "Type": "Task",
-            "Comment": "Rekognition DetectLabels via direct AWS SDK integration. No .sync suffix - aws-sdk: integrations are synchronous request/response. Resource: * required - Rekognition DetectLabels has no resource-level ARN.",
+            "Comment": "Rekognition DetectLabels. ResultPath: $.analysis merges analysis into iteration context -> output is {artifact, analysis}.",
             "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
             "Parameters": {
               "Image": {
@@ -112,11 +122,11 @@
               "MaxLabels": 30,
               "MinConfidence": 50
             },
-            "Comment2": "ResultSelector operates on the Rekognition response (Labels, LabelModelVersion). It cannot access task input fields like artifact.key.",
             "ResultSelector": {
               "type": "image",
               "Labels.$": "$.Labels"
             },
+            "ResultPath": "$.analysis",
             "Retry": [
               {
                 "ErrorEquals": ["Rekognition.ProvisionedThroughputExceededException"],
@@ -130,7 +140,7 @@
 
           "AnalyzeDocument": {
             "Type": "Task",
-            "Comment": "Textract AnalyzeDocument via direct AWS SDK integration. SINGLE-PAGE ONLY - Textract sync AnalyzeDocument accepts single-page PDF or PNG only. Multi-page requires async StartDocumentAnalysis (see guide Appendix D). Resource: * required - Textract has NO resource-level permissions at all.",
+            "Comment": "Textract AnalyzeDocument. Single-page only. ResultPath: $.analysis merges into iteration context.",
             "Resource": "arn:aws:states:::aws-sdk:textract:analyzeDocument",
             "Parameters": {
               "Document": {
@@ -145,6 +155,7 @@
               "type": "document",
               "Blocks.$": "$.Blocks"
             },
+            "ResultPath": "$.analysis",
             "Retry": [
               {
                 "ErrorEquals": ["Textract.ProvisionedThroughputExceededException"],
@@ -158,16 +169,21 @@
 
           "ReadText": {
             "Type": "Task",
+            "Comment": "Lambda reads S3 text file + Comprehend enrichment. ResultSelector forwards all 6 fields from Payload. ResultPath: $.analysis merges into iteration context.",
             "Resource": "arn:aws:states:::lambda:invoke",
             "Parameters": {
               "FunctionName": "${ReadTextFunctionArn}",
               "Payload.$": "$"
             },
             "ResultSelector": {
-              "body.$": "$.Payload"
+              "type.$": "$.Payload.type",
+              "key.$": "$.Payload.key",
+              "content.$": "$.Payload.content",
+              "sentiment.$": "$.Payload.sentiment",
+              "sentiment_scores.$": "$.Payload.sentiment_scores",
+              "key_phrases.$": "$.Payload.key_phrases"
             },
-            "ResultPath": "$",
-            "OutputPath": "$.body",
+            "ResultPath": "$.analysis",
             "Retry": [
               {
                 "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
@@ -194,43 +210,27 @@
           "Next": "RecordFailure"
         }
       ],
-      "Next": "NormalizeEvidence"
+      "Next": "BuildEvidence"
     },
 
-    "NormalizeEvidence": {
-      "Type": "Task",
-      "Comment": "Combines artifacts (original array with keys) and artifact_results (Map output, same order) into a single evidence dict for Bedrock.",
-      "Resource": "arn:aws:states:::lambda:invoke",
+    "BuildEvidence": {
+      "Type": "Pass",
+      "Comment": "Assembles ProcessArtifacts output ($.artifact_results = [{artifact, analysis},...]) into the shape SynthesizeVerdict expects. Drops artifacts and artifact_results from downstream state.",
       "Parameters": {
-        "FunctionName": "${NormalizeEvidenceFunctionArn}",
-        "Payload.$": "$"
-      },
-      "ResultSelector": {
-        "body.$": "$.Payload"
-      },
-      "ResultPath": "$",
-      "OutputPath": "$.body",
-      "Retry": [
-        {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2.0
+        "client_id.$": "$.client_id",
+        "claim_id.$": "$.claim_id",
+        "submitted_at.$": "$.submitted_at",
+        "decisions_bucket.$": "$.decisions_bucket",
+        "evidence": {
+          "artifacts.$": "$.artifact_results"
         }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "RecordFailure"
-        }
-      ],
+      },
       "Next": "SynthesizeVerdict"
     },
 
     "SynthesizeVerdict": {
       "Type": "Task",
-      "Comment": "Calls Bedrock Claude. All retry logic is in this ASL Retry block - boto3 inside the Lambda is configured with max_attempts=1 so the Lambda makes one attempt and the ASL retries the whole Lambda invocation on failure.",
+      "Comment": "Calls Bedrock Claude. ASL Retry owns retry logic. Lambda uses max_attempts=1 to avoid double-retry.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${SynthesizeVerdictFunctionArn}",
@@ -252,7 +252,7 @@
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0,
-          "Comment": "2->4->8 second backoff handles Bedrock throttling. Total retry budget ~14s, well within the 120s Lambda timeout."
+          "Comment": "2->4->8s backoff handles Bedrock throttling."
         }
       ],
       "Catch": [
@@ -262,35 +262,56 @@
           "Next": "RecordFailure"
         }
       ],
-      "Next": "ApplyGuardrails"
+      "Next": "GuardrailCheck"
     },
 
-    "ApplyGuardrails": {
-      "Type": "Task",
-      "Comment": "Enforces signal-trust rules: low confidence or DENY -> force NEEDS_REVIEW. Original LLM output is preserved for audit.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "${ApplyGuardrailsFunctionArn}",
-        "Payload.$": "$"
-      },
-      "ResultSelector": {
-        "body.$": "$.Payload"
-      },
-      "ResultPath": "$",
-      "OutputPath": "$.body",
-      "Catch": [
+    "GuardrailCheck": {
+      "Type": "Choice",
+      "Comment": "Downgrades to NEEDS_REVIEW if confidence is below threshold (low-trust signal). High-confidence DENY passes through and routes to NotifyClaimantDenied. ASL Choice -- no Lambda needed.",
+      "Choices": [
         {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "RecordFailure"
+          "Variable": "$.llm_verdict.confidence",
+          "NumericLessThan": 0.85,
+          "Next": "ForceNeedsReview"
         }
       ],
+      "Default": "PassThroughVerdict"
+    },
+
+    "ForceNeedsReview": {
+      "Type": "Pass",
+      "Comment": "Guardrail override: sets final_status to NEEDS_REVIEW and records why. Original llm_verdict preserved for audit.",
+      "Parameters": {
+        "client_id.$": "$.client_id",
+        "claim_id.$": "$.claim_id",
+        "submitted_at.$": "$.submitted_at",
+        "decisions_bucket.$": "$.decisions_bucket",
+        "evidence.$": "$.evidence",
+        "llm_verdict.$": "$.llm_verdict",
+        "final_status": "NEEDS_REVIEW",
+        "override_reason.$": "States.Format('Guardrail downgrade: original={}, confidence={}', $.llm_verdict.recommendation, $.llm_verdict.confidence)"
+      },
+      "Next": "WriteArtifacts"
+    },
+
+    "PassThroughVerdict": {
+      "Type": "Pass",
+      "Comment": "No override: copies llm_verdict.recommendation to final_status and passes all fields forward.",
+      "Parameters": {
+        "client_id.$": "$.client_id",
+        "claim_id.$": "$.claim_id",
+        "submitted_at.$": "$.submitted_at",
+        "decisions_bucket.$": "$.decisions_bucket",
+        "evidence.$": "$.evidence",
+        "llm_verdict.$": "$.llm_verdict",
+        "final_status.$": "$.llm_verdict.recommendation"
+      },
       "Next": "WriteArtifacts"
     },
 
     "WriteArtifacts": {
       "Type": "Task",
-      "Comment": "Writes decision.json, adjuster_email.md, evidence_bundle.json to the decisions S3 bucket and a record to DynamoDB.",
+      "Comment": "Writes decision.json, client_letter.txt, adjuster_brief.md, evidence_bundle.json to S3 and a record to DynamoDB. Returns final_status, client_letter, adjuster_brief for downstream SNS states.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${WriteArtifactsFunctionArn}",
@@ -301,6 +322,14 @@
       },
       "ResultPath": "$",
       "OutputPath": "$.body",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -308,62 +337,112 @@
           "Next": "RecordFailure"
         }
       ],
-      "Next": "ShouldNotifyAdjuster"
+      "Next": "RouteDecision"
     },
 
-    "ShouldNotifyAdjuster": {
+    "RouteDecision": {
       "Type": "Choice",
-      "Comment": "Send SNS notification only when the claim requires human adjuster review.",
+      "Comment": "Fan out to claimant via SES (APPROVE/DENY) or adjuster via SNS (NEEDS_REVIEW).",
       "Choices": [
         {
-          "Variable": "$.requires_adjuster_review",
-          "BooleanEquals": true,
-          "Next": "NotifyAdjuster"
+          "Variable": "$.final_status",
+          "StringEquals": "APPROVE",
+          "Next": "NotifyClaimantApproved"
+        },
+        {
+          "Variable": "$.final_status",
+          "StringEquals": "DENY",
+          "Next": "NotifyClaimantDenied"
         }
       ],
-      "Default": "ClaimProcessed"
+      "Default": "NotifyAdjuster"
+    },
+
+    "NotifyClaimantApproved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sesv2:sendEmail",
+      "Parameters": {
+        "FromEmailAddress": "${SenderEmail}",
+        "Destination": {
+          "ToAddresses": ["${ClaimantEmail}"]
+        },
+        "Content": {
+          "Simple": {
+            "Subject": {
+              "Data.$": "States.Format('Update on your claim {} - Approved', $.claim_id)",
+              "Charset": "UTF-8"
+            },
+            "Body": {
+              "Text": {
+                "Data.$": "$.client_letter",
+                "Charset": "UTF-8"
+              }
+            }
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "ClaimApproved"
+    },
+
+    "NotifyClaimantDenied": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sesv2:sendEmail",
+      "Parameters": {
+        "FromEmailAddress": "${SenderEmail}",
+        "Destination": {
+          "ToAddresses": ["${ClaimantEmail}"]
+        },
+        "Content": {
+          "Simple": {
+            "Subject": {
+              "Data.$": "States.Format('Update on your claim {} - Decision', $.claim_id)",
+              "Charset": "UTF-8"
+            },
+            "Body": {
+              "Text": {
+                "Data.$": "$.client_letter",
+                "Charset": "UTF-8"
+              }
+            }
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "ClaimDenied"
     },
 
     "NotifyAdjuster": {
       "Type": "Task",
-      "Comment": "Direct SNS Publish SDK integration - no Lambda needed for a simple notification. States.Format builds the message inline.",
       "Resource": "arn:aws:states:::aws-sdk:sns:publish",
       "Parameters": {
         "TopicArn": "${AdjusterNotificationsTopicArn}",
-        "Subject.$": "States.Format('Claim {} requires adjuster review - status: {}', $.claim_id, $.final_status)",
-        "Message.$": "$.adjuster_email_text"
+        "Subject.$": "States.Format('Claim {} requires adjuster review', $.claim_id)",
+        "Message.$": "$.adjuster_brief"
       },
       "ResultPath": null,
-      "Next": "ClaimProcessed"
+      "Next": "ClaimNeedsReview"
     },
 
-    "ClaimProcessed": {
+    "ClaimApproved": {
       "Type": "Succeed",
-      "Comment": "Claim processing complete. Check the decisions S3 bucket and DynamoDB ClaimsDecisions table for results."
+      "Comment": "Claim approved. Check decisions S3 bucket for client_letter.txt and decision.json."
+    },
+
+    "ClaimDenied": {
+      "Type": "Succeed",
+      "Comment": "Claim denied. Check decisions S3 bucket for client_letter.txt with denial reasons and appeal instructions."
+    },
+
+    "ClaimNeedsReview": {
+      "Type": "Succeed",
+      "Comment": "Claim routed to adjuster review. Check decisions S3 bucket for adjuster_brief.md."
     },
 
     "RecordFailure": {
-      "Type": "Task",
-      "Comment": "Writes a FAILED tombstone to DynamoDB so failures are queryable by execution name. Uses $$.Execution.Name as claim_id since client_id may not be in scope if the error occurred early in the pipeline.",
-      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
-      "Parameters": {
-        "TableName": "${ClaimsDecisionsTableName}",
-        "Item": {
-          "client_id": {"S": "PIPELINE_ERROR"},
-          "claim_id": {"S.$": "$$.Execution.Name"},
-          "final_status": {"S": "FAILED"},
-          "error_detail": {"S.$": "States.JsonToString($.error)"},
-          "processed_at": {"S.$": "$$.Execution.StartTime"}
-        }
-      },
-      "ResultPath": null,
-      "Next": "ClaimFailed"
-    },
-
-    "ClaimFailed": {
       "Type": "Fail",
       "Error": "ClaimProcessingFailed",
-      "Cause": "An error occurred during claim processing. See DynamoDB ClaimsDecisions table (PK=PIPELINE_ERROR, SK=execution-name) and SFN execution history for details."
+      "Cause": "An error occurred during claim processing. See SFN execution history and CloudWatch Logs for details."
     }
 
   }

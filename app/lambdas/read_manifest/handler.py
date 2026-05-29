@@ -16,7 +16,7 @@ class ManifestError(Exception):
     pass
 
 
-def handler(event, context):
+def lambda_handler(event, context):
     # Input: EventBridge S3 "Object Created" event for the manifest.json file.
     # The state machine starts with this event as its input.
     bucket = event["detail"]["bucket"]["name"]

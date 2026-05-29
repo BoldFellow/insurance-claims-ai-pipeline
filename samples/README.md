@@ -3,7 +3,13 @@
 This directory contains synthetic sample files for the insurance-claims-ai-pipeline lab.
 All files are generated or hand-written for demonstration purposes only.
 
-## Files
+Each subfolder is a self-contained sample set: upload its contents to the S3 intake
+bucket under the correct prefix, then upload the manifest to trigger the pipeline.
+
+## approve/ (CLM-001)
+
+Standard auto-insurance claim with clear evidence. Produces a high-confidence APPROVE.
+Use this set first to verify the happy path end-to-end.
 
 | File | Type | Used by |
 |------|------|---------|
@@ -12,12 +18,36 @@ All files are generated or hand-written for demonstration purposes only.
 | `police-report.pdf` | Document (single-page PDF) | Textract AnalyzeDocument |
 | `statement.txt` | Text (UTF-8) | ReadText Lambda -> Bedrock |
 
-## red-flag/
+Expected outcome:
+- `final_status=APPROVE` with `confidence >= 0.85`
+- `client_letter.txt` contains approval language (no red flags, no internal reasoning)
+- SNS publish to ClaimantNotificationsTopic only
 
-Same structure as above but with a statement that contains multiple red-flag signals
+## red-flag/ (CLM-002)
+
+Same structure as approve/ but with a statement containing multiple red-flag signals
 (no police report, vague incident details, coverage increase 2 weeks prior, damage
-inconsistent with stated cause). Use this set in S7 to observe the guardrail
-downgrading the LLM recommendation to NEEDS_REVIEW.
+inconsistent with stated cause). Use this set to observe a low-confidence
+LLM verdict being downgraded to NEEDS_REVIEW by the GuardrailCheck state.
+
+Expected outcome:
+- `final_status=NEEDS_REVIEW` (guardrail override)
+- `override_reason` populated in decision.json
+- `client_letter.txt` is the short "under review" template (no denial reasons leaked)
+- SNS publish to AdjusterNotificationsTopic only
+
+## deny/ (CLM-003)
+
+Same structure as approve/ but with a statement claiming a **bicycle** (a 2023 Trek
+mountain bike) under an auto insurance policy. The submitted photo shows a car
+(Rekognition labels: Car, Vehicle), which does not match the claimed item. This
+coverage ineligibility and evidence mismatch produces a high-confidence DENY from
+Bedrock, which passes through the GuardrailCheck and routes to NotifyClaimantDenied.
+
+Expected outcome:
+- `final_status=DENY` with `confidence >= 0.85`
+- `client_letter.txt` contains denial reasons and appeal instructions
+- SNS publish to ClaimantNotificationsTopic only (adjuster is not notified)
 
 ## Photo requirements
 
@@ -53,10 +83,9 @@ PDF constraints for this pipeline:
 All files in this directory are synthetic, generated, or original works created
 for this educational lab. No real personal information is used.
 
-- `statement.txt`: Original fictional narrative. No real persons.
-- `police-report.pdf`: Synthetic. Marked "Synthetic -- for demonstration only".
-- `photo-damage.jpg`: Public domain. Source: Wikimedia Commons, "Damaged car from hail in Missouri, April 2001". License: Public Domain (pre-1928 US government photo).
-- `red-flag/`: Same terms as above.
+- `*/statement.txt`: Original fictional narrative. No real persons.
+- `*/police-report.pdf`: Synthetic single-page PDF generated for this lab. No real persons or incidents.
+- `*/photo-damage.jpg`: Public domain. Source: Wikimedia Commons, "Damaged car from hail in Missouri, April 2001". License: Public Domain (pre-1928 US government photo).
 
 ## Regenerating files
 

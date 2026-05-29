@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   insurance-claims-ai-pipeline: S3 + EventBridge trigger -> Step Functions Standard
-  workflow -> Rekognition + Textract + Bedrock -> DynamoDB + S3 decisions + SNS.
+  workflow (4 Lambdas) -> Rekognition + Textract + Bedrock -> DynamoDB + S3 decisions
+  + SES claimant email (APPROVE/DENY) + SNS adjuster topic (NEEDS_REVIEW).
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -20,8 +21,10 @@ Parameters:
     Type: String
     Default: "0.85"
     Description: >
-      LLM confidence score below which the recommendation is downgraded to
-      NEEDS_REVIEW. Float as string (0.0 to 1.0).
+      Reference value documenting the confidence threshold used in GuardrailCheck.
+      The threshold is hardcoded as 0.85 directly in the DefinitionString. To change
+      it, edit the NumericLessThan value in the GuardrailCheck Choice state in the
+      DefinitionString and redeploy.
 
   AdjusterEmail:
     Type: String
@@ -30,6 +33,20 @@ Parameters:
       Optional email address to subscribe to the adjuster SNS topic. Leave
       blank to skip subscription. You must confirm the subscription email
       before notifications are delivered.
+
+  SenderEmail:
+    Type: String
+    Description: >
+      Required. SES verified email address used as the From address for claimant
+      notifications (APPROVE and DENY outcomes). Must be verified as an SES identity
+      in your account before deploying. Example: claims@yourdomain.com
+
+  ClaimantEmail:
+    Type: String
+    Description: >
+      Required. Destination email address for claimant notifications (APPROVE and DENY).
+      Must be verified in SES if your account is in sandbox mode. In production
+      (SES out of sandbox), any address is accepted.
 
 
 # ---------------------------------------------------------------------------
@@ -44,44 +61,6 @@ Conditions:
 Resources:
 
   # -------------------------------------------------------------------------
-  # KMS key -- SSE-KMS for S3 buckets, DynamoDB, and CloudWatch Log Groups
-  # -------------------------------------------------------------------------
-  KmsKey:
-    Type: AWS::KMS::Key
-    Properties:
-      Description: insurance-claims-ai-pipeline SSE key
-      EnableKeyRotation: true
-      KeyPolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: RootAdmin
-            Effect: Allow
-            Principal:
-              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
-            Action: "kms:*"
-            Resource: "*"
-          - Sid: CloudWatchLogs
-            Effect: Allow
-            Principal:
-              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
-            Action:
-              - kms:Encrypt
-              - kms:Decrypt
-              - kms:ReEncrypt*
-              - kms:GenerateDataKey*
-              - kms:DescribeKey
-            Resource: "*"
-            Condition:
-              ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
-
-  KmsAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub "alias/${AWS::StackName}-key"
-      TargetKeyId: !Ref KmsKey
-
-  # -------------------------------------------------------------------------
   # S3 -- Intake bucket (claim uploads)
   # -------------------------------------------------------------------------
   IntakeBucket:
@@ -90,8 +69,6 @@ Resources:
       # Deterministic name avoids circular dependency with IAM roles that
       # reference the bucket ARN. Roles use !Sub with the same formula.
       BucketName: !Sub "${AWS::StackName}-intake-${AWS::AccountId}"
-      VersioningConfiguration:
-        Status: Enabled
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -100,9 +77,7 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref KmsKey
-            BucketKeyEnabled: true
+              SSEAlgorithm: AES256
       NotificationConfiguration:
         EventBridgeConfiguration:
           EventBridgeEnabled: true
@@ -132,8 +107,6 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "${AWS::StackName}-decisions-${AWS::AccountId}"
-      VersioningConfiguration:
-        Status: Enabled
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -142,9 +115,7 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref KmsKey
-            BucketKeyEnabled: true
+              SSEAlgorithm: AES256
 
   DecisionsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -167,9 +138,7 @@ Resources:
   # -------------------------------------------------------------------------
   # DynamoDB -- ClaimsDecisions table
   # PK=client_id (S), SK=claim_id (S)
-  # GSI: StatusIndex -- status (S) + processed_at (S)
-  # Note: status has low cardinality (APPROVE/DENY/NEEDS_REVIEW/FAILED).
-  # GSI hot-partition risk in real high-volume workloads; fine for this lab.
+  # GSI: StatusIndex -- final_status (S) + processed_at (S)
   # -------------------------------------------------------------------------
   ClaimsDecisionsTable:
     Type: AWS::DynamoDB::Table
@@ -177,10 +146,6 @@ Resources:
     Properties:
       TableName: !Sub "${AWS::StackName}-ClaimsDecisions"
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref KmsKey
       AttributeDefinitions:
         - AttributeName: client_id
           AttributeType: S
@@ -209,13 +174,12 @@ Resources:
         Enabled: true
 
   # -------------------------------------------------------------------------
-  # SNS -- Adjuster notifications topic
+  # SNS -- Adjuster notifications topic (NEEDS_REVIEW path)
   # -------------------------------------------------------------------------
   AdjusterNotificationsTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub "${AWS::StackName}-AdjusterNotifications"
-      KmsMasterKeyId: !Ref KmsKey
 
   AdjusterEmailSubscription:
     Type: AWS::SNS::Subscription
@@ -233,56 +197,30 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/states/${AWS::StackName}-ClaimsStateMachine"
       RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
 
   ReadManifestLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ReadManifest"
       RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
-
-  ValidateArtifactsLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ValidateArtifacts"
-      RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
 
   ReadTextLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ReadText"
       RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
-
-  NormalizeEvidenceLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-NormalizeEvidence"
-      RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
 
   SynthesizeVerdictLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-SynthesizeVerdict"
       RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
-
-  ApplyGuardrailsLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ApplyGuardrails"
-      RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
 
   WriteArtifactsLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-WriteArtifacts"
       RetentionInDays: 14
-      KmsKeyId: !GetAtt KmsKey.Arn
 
   # -------------------------------------------------------------------------
   # IAM -- Lambda execution roles (one per Lambda, least-privilege)
@@ -308,38 +246,6 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:GenerateDataKey
-                Resource: !GetAtt KmsKey.Arn
-
-  ValidateArtifactsRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${AWS::StackName}-ValidateArtifactsRole"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: ValidateArtifactsPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: s3:GetObject
-                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:GenerateDataKey
-                Resource: !GetAtt KmsKey.Arn
 
   ReadTextRole:
     Type: AWS::IAM::Role
@@ -364,23 +270,9 @@ Resources:
                 Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
               - Effect: Allow
                 Action:
-                  - kms:Decrypt
-                  - kms:GenerateDataKey
-                Resource: !GetAtt KmsKey.Arn
-
-  NormalizeEvidenceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${AWS::StackName}-NormalizeEvidenceRole"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                  - comprehend:DetectSentiment
+                  - comprehend:DetectKeyPhrases
+                Resource: "*"
 
   SynthesizeVerdictRole:
     Type: AWS::IAM::Role
@@ -401,29 +293,15 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # Cross-region inference profile: must grant on BOTH the profile ARN
-              # AND the underlying foundation-model ARNs in every region the profile
-              # spans. Missing any region throws AccessDeniedException at runtime.
+              # AND the underlying foundation-model ARNs. Foundation model ARNs have
+              # no account ID (double ::) and the region wildcard is required because
+              # the profile load-balances across all regions in the group -- the set
+              # of target regions is controlled by AWS and can change without notice.
               - Effect: Allow
                 Action: bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
-                  - !Sub "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
-                  - !Sub "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
-                  - !Sub "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
-
-  ApplyGuardrailsRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${AWS::StackName}-ApplyGuardrailsRole"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
 
   WriteArtifactsRole:
     Type: AWS::IAM::Role
@@ -447,14 +325,8 @@ Resources:
                 Action: s3:PutObject
                 Resource: !Sub "arn:aws:s3:::${AWS::StackName}-decisions-${AWS::AccountId}/clients/*"
               - Effect: Allow
-                Action:
-                  - dynamodb:PutItem
+                Action: dynamodb:PutItem
                 Resource: !GetAtt ClaimsDecisionsTable.Arn
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:GenerateDataKey
-                Resource: !GetAtt KmsKey.Arn
 
   # -------------------------------------------------------------------------
   # IAM -- Step Functions execution role
@@ -475,43 +347,39 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Lambda invocations
+              # Lambda invocations (4 functions only)
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource:
                   - !GetAtt ReadManifestFunction.Arn
-                  - !GetAtt ValidateArtifactsFunction.Arn
                   - !GetAtt ReadTextFunction.Arn
-                  - !GetAtt NormalizeEvidenceFunction.Arn
                   - !GetAtt SynthesizeVerdictFunction.Arn
-                  - !GetAtt ApplyGuardrailsFunction.Arn
                   - !GetAtt WriteArtifactsFunction.Arn
-              # Rekognition -- no resource-level ARN for DetectLabels; action is the constraint
+              # S3 HeadObject for ValidateArtifacts Map
               - Effect: Allow
-                Action: rekognition:DetectLabels
-                Resource: "*"
-              # Textract -- no resource-level permissions at all; Resource: * is required
-              - Effect: Allow
-                Action: textract:AnalyzeDocument
-                Resource: "*"
-              # DynamoDB PutItem for RecordFailure tombstone
-              - Effect: Allow
-                Action: dynamodb:PutItem
-                Resource: !GetAtt ClaimsDecisionsTable.Arn
-              # SNS Publish for NotifyAdjuster
-              - Effect: Allow
-                Action: sns:Publish
-                Resource: !Ref AdjusterNotificationsTopic
-              # S3 GetObject for Rekognition/Textract direct integrations (read from intake)
+                Action: s3:HeadObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
+              # S3 GetObject for Rekognition/Textract direct integrations
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${AWS::StackName}-intake-${AWS::AccountId}/clients/*"
-              # KMS for SSE-KMS bucket access
+              # Rekognition -- no resource-level ARN for DetectLabels
               - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:GenerateDataKey
-                Resource: !GetAtt KmsKey.Arn
+                Action: rekognition:DetectLabels
+                Resource: "*"
+              # Textract -- no resource-level permissions at all
+              - Effect: Allow
+                Action: textract:AnalyzeDocument
+                Resource: "*"
+              # SNS Publish -- adjuster topic (NEEDS_REVIEW path)
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AdjusterNotificationsTopic
+              # SES SendEmail -- claimant notifications (APPROVE and DENY paths)
+              # Scoped to the verified sender identity only
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SenderEmail}"
               # CloudWatch Logs for state machine execution logging
               - Effect: Allow
                 Action:
@@ -527,7 +395,7 @@ Resources:
                   - logs:PutResourcePolicy
                   - logs:UpdateLogDelivery
                 Resource: "*"
-              # X-Ray tracing (optional -- remove if X-Ray is not enabled)
+              # X-Ray tracing
               - Effect: Allow
                 Action:
                   - xray:PutTraceSegments
@@ -561,6 +429,7 @@ Resources:
 
   # -------------------------------------------------------------------------
   # Lambda functions (Python 3.12, ARM64)
+  # All code inline via ZipFile. Handler: index.lambda_handler -> def lambda_handler().
   # -------------------------------------------------------------------------
   ReadManifestFunction:
     Type: AWS::Lambda::Function
@@ -569,7 +438,7 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-ReadManifest"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: index.handler
+      Handler: index.lambda_handler
       Role: !GetAtt ReadManifestRole.Arn
       MemorySize: 256
       Timeout: 30
@@ -593,7 +462,7 @@ Resources:
               pass
 
 
-          def handler(event, context):
+          def lambda_handler(event, context):
               bucket = event["detail"]["bucket"]["name"]
               key = event["detail"]["object"]["key"]
 
@@ -678,54 +547,6 @@ Resources:
           INTAKE_BUCKET: !Sub "${AWS::StackName}-intake-${AWS::AccountId}"
           DECISIONS_BUCKET: !Sub "${AWS::StackName}-decisions-${AWS::AccountId}"
 
-  ValidateArtifactsFunction:
-    Type: AWS::Lambda::Function
-    DependsOn: ValidateArtifactsLogGroup
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-ValidateArtifacts"
-      Runtime: python3.12
-      Architectures: [arm64]
-      Handler: index.handler
-      Role: !GetAtt ValidateArtifactsRole.Arn
-      MemorySize: 256
-      Timeout: 30
-      Code:
-        ZipFile: |
-          import boto3
-          from botocore.exceptions import ClientError
-
-          s3 = boto3.client("s3")
-
-
-          class MissingArtifactError(Exception):
-              pass
-
-
-          def handler(event, context):
-              intake_bucket = event["intake_bucket"]
-              artifacts = event["artifacts"]
-              missing = []
-
-              for artifact in artifacts:
-                  key = artifact["key"]
-                  try:
-                      s3.head_object(Bucket=intake_bucket, Key=key)
-                  except ClientError as e:
-                      code = e.response["Error"]["Code"]
-                      if code in ("404", "NoSuchKey"):
-                          missing.append(key)
-                      else:
-                          raise
-
-              if missing:
-                  raise MissingArtifactError(
-                      f"Manifest lists {len(missing)} artifact(s) not yet present in S3. "
-                      f"Missing keys: {missing}. "
-                      f"Ensure all artifacts are uploaded before dropping manifest.json."
-                  )
-
-              return event
-
   ReadTextFunction:
     Type: AWS::Lambda::Function
     DependsOn: ReadTextLogGroup
@@ -733,7 +554,7 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-ReadText"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: index.handler
+      Handler: index.lambda_handler
       Role: !GetAtt ReadTextRole.Arn
       MemorySize: 256
       Timeout: 30
@@ -742,10 +563,13 @@ Resources:
           import boto3
 
           s3 = boto3.client("s3")
+          comprehend = boto3.client("comprehend")
+
           MAX_TEXT_BYTES = 100_000
+          MAX_COMPREHEND_BYTES = 5_000
 
 
-          def handler(event, context):
+          def lambda_handler(event, context):
               artifact = event["artifact"]
               intake_bucket = artifact["intake_bucket"]
               key = artifact["key"]
@@ -761,88 +585,30 @@ Resources:
               except UnicodeDecodeError:
                   content = body.decode("utf-8", errors="replace")
 
-              return {"type": "text", "key": key, "content": content}
+              comprehend_input = content[:MAX_COMPREHEND_BYTES]
 
-  NormalizeEvidenceFunction:
-    Type: AWS::Lambda::Function
-    DependsOn: NormalizeEvidenceLogGroup
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-NormalizeEvidence"
-      Runtime: python3.12
-      Architectures: [arm64]
-      Handler: index.handler
-      Role: !GetAtt NormalizeEvidenceRole.Arn
-      MemorySize: 256
-      Timeout: 30
-      Code:
-        ZipFile: |
-          def handler(event, context):
-              artifacts = event.get("artifacts", [])
-              artifact_results = event.get("artifact_results", [])
+              sentiment_response = comprehend.detect_sentiment(
+                  Text=comprehend_input,
+                  LanguageCode="en",
+              )
 
-              images, documents, texts = [], [], []
+              phrases_response = comprehend.detect_key_phrases(
+                  Text=comprehend_input,
+                  LanguageCode="en",
+              )
 
-              for artifact, result in zip(artifacts, artifact_results):
-                  atype = artifact["type"]
-                  akey = artifact["key"]
-
-                  if atype == "image":
-                      labels = [
-                          {"name": l.get("Name", ""), "confidence": round(l.get("Confidence", 0), 2)}
-                          for l in result.get("Labels", [])[:30]
-                      ]
-                      images.append({"key": akey, "labels": labels})
-
-                  elif atype == "document":
-                      blocks = result.get("Blocks", [])
-                      lines, form_fields = [], []
-                      key_map, value_map = {}, {}
-                      block_index = {b["Id"]: b for b in blocks}
-
-                      for block in blocks:
-                          btype = block.get("BlockType", "")
-                          if btype == "LINE":
-                              lines.append(block.get("Text", ""))
-                          elif btype == "KEY_VALUE_SET":
-                              entity = block.get("EntityTypes", [])
-                              def get_child_text(blk):
-                                  words = []
-                                  for rel in blk.get("Relationships", []):
-                                      if rel["Type"] == "CHILD":
-                                          for cid in rel["Ids"]:
-                                              child = block_index.get(cid, {})
-                                              if child.get("BlockType") == "WORD":
-                                                  words.append(child.get("Text", ""))
-                                  return " ".join(words)
-                              if "KEY" in entity:
-                                  key_text = get_child_text(block)
-                                  for rel in block.get("Relationships", []):
-                                      if rel["Type"] == "VALUE":
-                                          for vid in rel["Ids"]:
-                                              value_map[vid] = key_text
-                                  key_map[block["Id"]] = key_text
-                              elif "VALUE" in entity:
-                                  val_text = get_child_text(block)
-                                  key_text = value_map.get(block["Id"], "")
-                                  if key_text:
-                                      form_fields.append({"key": key_text, "value": val_text})
-
-                      documents.append({
-                          "key": akey,
-                          "extracted_text": "\n".join(lines)[:4000],
-                          "form_fields": form_fields[:50],
-                          "tables": [],
-                      })
-
-                  elif atype == "text":
-                      texts.append({"key": akey, "content": result.get("content", "")[:4000]})
+              top_phrases = [
+                  p["Text"]
+                  for p in sorted(phrases_response["KeyPhrases"], key=lambda x: x["Score"], reverse=True)[:10]
+              ]
 
               return {
-                  "client_id": event["client_id"],
-                  "claim_id": event["claim_id"],
-                  "submitted_at": event.get("submitted_at", ""),
-                  "decisions_bucket": event["decisions_bucket"],
-                  "evidence": {"images": images, "documents": documents, "texts": texts},
+                  "type": "text",
+                  "key": key,
+                  "content": content,
+                  "sentiment": sentiment_response["Sentiment"],
+                  "sentiment_scores": sentiment_response["SentimentScore"],
+                  "key_phrases": top_phrases,
               }
 
   SynthesizeVerdictFunction:
@@ -852,7 +618,7 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-SynthesizeVerdict"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: index.handler
+      Handler: index.lambda_handler
       Role: !GetAtt SynthesizeVerdictRole.Arn
       MemorySize: 512
       Timeout: 120
@@ -882,57 +648,110 @@ Resources:
               "You are NOT making a final decision. Your output will be validated and may be "
               "overridden before any action is taken.\n\n"
               "Analyze the evidence provided and output a JSON object with this exact schema:\n"
-              '{"recommendation":"APPROVE or DENY or NEEDS_REVIEW","confidence":<float 0.0-1.0>,'
-              '"reasoning":"<2-4 sentences>","red_flags":["<list of concerns, empty if none>"],'
-              '"draft_email":"<professional draft email from adjuster to claimant, 3-5 sentences>"}\n\n'
+              '{"claimant_name":"<full name extracted from evidence; empty string if not found>",'
+              '"recommendation":"APPROVE or DENY or NEEDS_REVIEW","confidence":<float 0.0-1.0>,'
+              '"reasoning":"<2-4 sentences factual>","approval_rationale":"<one sentence if APPROVE else empty string>",'
+              '"denial_reasons":["<plain-language reason; empty list if not DENY>"],'
+              '"red_flags":["<concerns for any recommendation; empty list if none>"],'
+              '"client_letter":"<professional letter body to claimant; 3-5 sentences; NO salutation or closing>",'
+              '"adjuster_summary":"<one-paragraph internal summary for the adjuster>"}\n\n'
+              "STRICT RULES for client_letter:\n"
+              "- DO NOT mention: confidence scores, red flags, internal reasoning, AI, automated systems\n"
+              "- DO NOT include denial reasons even for DENY -- those go in denial_reasons only\n"
+              "- Professional, empathetic, plain language; 3-5 sentences\n"
+              "- No salutation (Dear...) or closing (Sincerely...) -- added by the system\n"
+              "- If recommendation is DENY: write 1-2 sentences acknowledging the claim cannot be approved; do NOT include the reasons (those go in denial_reasons); do NOT set to empty string\n"
+              "- If recommendation is NEEDS_REVIEW: set client_letter to empty string -- a human adjuster will draft the communication\n\n"
+              "adjuster_summary MAY reference confidence, red flags, denial reasons, and internal concerns.\n\n"
               "Guidelines:\n"
               "- APPROVE: evidence is consistent, no red flags, straightforward claim\n"
               "- DENY: clear evidence of fraud, excluded peril, or policy violation (rare)\n"
-              "- NEEDS_REVIEW: ambiguous evidence, conflicting signals, or anything requiring judgment\n"
-              "- confidence: how certain you are (0.0=no idea, 1.0=completely certain)\n"
-              "- draft_email: written as if from adjuster to claimant (professional, empathetic)\n\n"
+              "- NEEDS_REVIEW: ambiguous evidence, conflicting signals, or anything requiring judgment\n\n"
               "Output ONLY the JSON object. No preamble, no explanation outside the JSON."
           )
 
 
-          def handler(event, context):
+          def lambda_handler(event, context):
               client_id = event["client_id"]
               claim_id = event["claim_id"]
               evidence = event["evidence"]
 
               parts = [f"Claim ID: {claim_id}\nClient: {client_id}\n\n## Evidence\n"]
 
-              if evidence.get("images"):
-                  parts.append("### Image Analysis (Rekognition)\n")
-                  for img in evidence["images"]:
+              for item in evidence.get("artifacts", []):
+                  artifact = item.get("artifact", {})
+                  analysis = item.get("analysis", {})
+                  atype = analysis.get("type", "")
+                  akey = artifact.get("key", "")
+
+                  if atype == "image":
                       labels = ", ".join(
-                          f"{l['name']} ({l['confidence']:.0f}%)" for l in img["labels"]
+                          f"{l.get('Name','')} ({l.get('Confidence',0):.0f}%)"
+                          for l in analysis.get("Labels", [])
                       )
-                      parts.append(f"File: {img['key']}\nDetected: {labels}\n\n")
+                      parts.append(f"### Image Analysis (Rekognition): {akey}\nDetected: {labels}\n\n")
 
-              if evidence.get("documents"):
-                  parts.append("### Document Analysis (Textract)\n")
-                  for doc in evidence["documents"]:
-                      parts.append(f"File: {doc['key']}\n")
-                      if doc["form_fields"]:
-                          fields = "; ".join(
-                              f"{f['key']}: {f['value']}" for f in doc["form_fields"][:20]
-                          )
+                  elif atype == "document":
+                      blocks = analysis.get("Blocks", [])
+                      lines = []
+                      form_fields = []
+                      value_map = {}
+                      block_index = {b["Id"]: b for b in blocks}
+
+                      def get_child_text(blk):
+                          words = []
+                          for rel in blk.get("Relationships", []):
+                              if rel["Type"] == "CHILD":
+                                  for cid in rel["Ids"]:
+                                      child = block_index.get(cid, {})
+                                      if child.get("BlockType") == "WORD":
+                                          words.append(child.get("Text", ""))
+                          return " ".join(words)
+
+                      for block in blocks:
+                          btype = block.get("BlockType", "")
+                          if btype == "LINE":
+                              lines.append(block.get("Text", ""))
+                          elif btype == "KEY_VALUE_SET":
+                              entity = block.get("EntityTypes", [])
+                              if "KEY" in entity:
+                                  key_text = get_child_text(block)
+                                  for rel in block.get("Relationships", []):
+                                      if rel["Type"] == "VALUE":
+                                          for vid in rel["Ids"]:
+                                              value_map[vid] = key_text
+                              elif "VALUE" in entity:
+                                  val_text = get_child_text(block)
+                                  key_text = value_map.get(block["Id"], "")
+                                  if key_text:
+                                      form_fields.append({"key": key_text, "value": val_text})
+
+                      parts.append(f"### Document Analysis (Textract): {akey}\n")
+                      if form_fields:
+                          fields = "; ".join(f"{f['key']}: {f['value']}" for f in form_fields[:20])
                           parts.append(f"Form fields: {fields}\n")
-                      if doc["extracted_text"]:
-                          parts.append(f"Extracted text:\n{doc['extracted_text'][:2000]}\n\n")
+                      if lines:
+                          parts.append(f"Extracted text:\n{chr(10).join(lines)[:2000]}\n\n")
 
-              if evidence.get("texts"):
-                  parts.append("### Written Statements\n")
-                  for txt in evidence["texts"]:
-                      parts.append(f"File: {txt['key']}\n{txt['content'][:2000]}\n\n")
+                  elif atype == "text":
+                      content = analysis.get("content", "")
+                      sentiment = analysis.get("sentiment", "")
+                      key_phrases = analysis.get("key_phrases", [])
+                      phrases_str = ", ".join(key_phrases) if key_phrases else "none"
+                      parts.append(
+                          f"### Written Statement: {akey}\n"
+                          f"Comprehend sentiment: {sentiment}\n"
+                          f"Key phrases: {phrases_str}\n\n"
+                          f"{content[:2000]}\n\n"
+                      )
 
               parts.append("\nBased on this evidence, provide your adjudication recommendation as a JSON object.")
               user_message = "".join(parts)
 
               body = {
                   "anthropic_version": "bedrock-2023-05-31",
-                  "max_tokens": 1024,
+                  "max_tokens": 2048,
+                  "temperature": 0,
                   "system": SYSTEM_PROMPT,
                   "messages": [{"role": "user", "content": user_message}],
               }
@@ -956,7 +775,11 @@ Resources:
                   else:
                       raise ValueError(f"Bedrock response is not valid JSON: {llm_text[:500]}")
 
-              required = ["recommendation", "confidence", "reasoning", "red_flags", "draft_email"]
+              required = [
+                  "claimant_name", "recommendation", "confidence", "reasoning",
+                  "approval_rationale", "denial_reasons", "red_flags",
+                  "client_letter", "adjuster_summary",
+              ]
               for field in required:
                   if field not in verdict:
                       raise ValueError(f"Bedrock verdict missing required field: {field}")
@@ -976,67 +799,6 @@ Resources:
         Variables:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
 
-  ApplyGuardrailsFunction:
-    Type: AWS::Lambda::Function
-    DependsOn: ApplyGuardrailsLogGroup
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-ApplyGuardrails"
-      Runtime: python3.12
-      Architectures: [arm64]
-      Handler: index.handler
-      Role: !GetAtt ApplyGuardrailsRole.Arn
-      MemorySize: 256
-      Timeout: 30
-      Code:
-        ZipFile: |
-          import os
-
-          CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.85"))
-
-
-          def handler(event, context):
-              llm_verdict = event["llm_verdict"]
-              recommendation = llm_verdict["recommendation"]
-              confidence = float(llm_verdict["confidence"])
-
-              original_recommendation = recommendation
-              override_reason = None
-
-              if recommendation == "DENY":
-                  override_reason = (
-                      "LLM-derived DENY signals require human review. "
-                      "Deterministic denial (policy lapse, fraud list) must be handled "
-                      "by a rules engine, not an LLM recommendation alone."
-                  )
-                  recommendation = "NEEDS_REVIEW"
-
-              elif confidence < CONFIDENCE_THRESHOLD:
-                  override_reason = (
-                      f"LLM confidence {confidence:.2f} is below threshold {CONFIDENCE_THRESHOLD:.2f}. "
-                      "Low-confidence signals escalate to human review."
-                  )
-                  recommendation = "NEEDS_REVIEW"
-
-              return {
-                  "client_id": event["client_id"],
-                  "claim_id": event["claim_id"],
-                  "submitted_at": event.get("submitted_at", ""),
-                  "decisions_bucket": event["decisions_bucket"],
-                  "evidence": event["evidence"],
-                  "llm_verdict": llm_verdict,
-                  "final_status": recommendation,
-                  "original_recommendation": original_recommendation,
-                  "confidence": confidence,
-                  "override_reason": override_reason,
-                  "reasoning": llm_verdict.get("reasoning", ""),
-                  "red_flags": llm_verdict.get("red_flags", []),
-                  "draft_email": llm_verdict.get("draft_email", ""),
-                  "requires_adjuster_review": recommendation == "NEEDS_REVIEW",
-              }
-      Environment:
-        Variables:
-          CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
-
   WriteArtifactsFunction:
     Type: AWS::Lambda::Function
     DependsOn: WriteArtifactsLogGroup
@@ -1044,7 +806,7 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-WriteArtifacts"
       Runtime: python3.12
       Architectures: [arm64]
-      Handler: index.handler
+      Handler: index.lambda_handler
       Role: !GetAtt WriteArtifactsRole.Arn
       MemorySize: 256
       Timeout: 30
@@ -1059,8 +821,23 @@ Resources:
           dynamodb = boto3.client("dynamodb")
           TABLE_NAME = os.environ["DECISIONS_TABLE_NAME"]
 
+          _CLAIMANT_CLOSE = (
+              "\n\nPlease retain your claim reference number for your records."
+              " If you have questions, contact us at claims@example.com or 1-800-CLAIMS-1."
+              "\n\nSincerely,\nClaims Department"
+          )
+          _NEEDS_REVIEW_LETTER = (
+              "Thank you for submitting your insurance claim. We have received your claim"
+              " and it is currently under review by one of our licensed adjusters.\n\n"
+              "An adjuster will contact you within 5 business days with an update on the"
+              " status of your claim. Please have your claim reference number available"
+              " when we contact you.\n\n"
+              "If you have any questions in the meantime, please contact us at"
+              " claims@example.com or 1-800-CLAIMS-1."
+          )
 
-          def handler(event, context):
+
+          def lambda_handler(event, context):
               client_id = event["client_id"]
               claim_id = event["claim_id"]
               decisions_bucket = event["decisions_bucket"]
@@ -1070,18 +847,23 @@ Resources:
               created_at = now.isoformat()
               ttl = int((now + timedelta(days=90)).timestamp())
 
+              llm_verdict = event["llm_verdict"]
+              final_status = event["final_status"]
+              override_reason = event.get("override_reason")
+
               decision = {
                   "client_id": client_id,
                   "claim_id": claim_id,
                   "submitted_at": event.get("submitted_at", ""),
                   "processed_at": created_at,
-                  "final_status": event["final_status"],
-                  "original_recommendation": event["original_recommendation"],
-                  "confidence": event["confidence"],
-                  "override_reason": event.get("override_reason"),
-                  "reasoning": event["reasoning"],
-                  "red_flags": event["red_flags"],
-                  "requires_adjuster_review": event["requires_adjuster_review"],
+                  "final_status": final_status,
+                  "original_recommendation": llm_verdict["recommendation"],
+                  "confidence": llm_verdict["confidence"],
+                  "override_reason": override_reason,
+                  "reasoning": llm_verdict.get("reasoning", ""),
+                  "approval_rationale": llm_verdict.get("approval_rationale", ""),
+                  "denial_reasons": llm_verdict.get("denial_reasons", []),
+                  "red_flags": llm_verdict.get("red_flags", []),
               }
 
               s3.put_object(
@@ -1091,41 +873,91 @@ Resources:
                   ContentType="application/json",
               )
 
-              draft_email = event.get("draft_email", "")
-              status_line = {
-                  "APPROVE": "Your claim has been reviewed and we are pleased to inform you of a favorable recommendation.",
-                  "DENY": "Your claim has been reviewed. Our adjuster will contact you to discuss the findings.",
-                  "NEEDS_REVIEW": "Your claim requires additional review by one of our adjusters, who will be in touch shortly.",
-              }.get(decision["final_status"], "Your claim is under review.")
-              red_flags_section = ""
-              if decision["red_flags"]:
-                  flags = "\n".join(f"- {f}" for f in decision["red_flags"])
-                  red_flags_section = f"\n\n**Internal Notes (do not send to claimant):**\n{flags}"
-              email_md = (
-                  f"# Draft Adjuster Communication\n"
-                  f"**Claim ID:** {claim_id}\n"
-                  f"**Client:** {client_id}\n"
-                  f"**Processed:** {created_at}\n"
-                  f"**Status:** {decision['final_status']}\n"
-                  f"**Confidence:** {decision['confidence']:.0%}\n\n"
-                  f"> This is a DRAFT generated by the AI pipeline. Review and edit before sending.\n"
-                  f"> Do not send if override_reason is present -- escalate to supervisor first.\n\n"
-                  f"---\n\nDear Claimant,\n\n"
-                  f"{draft_email if draft_email else status_line}\n\n"
-                  f"If you have any questions regarding your claim {claim_id}, please do not hesitate to contact us.\n\n"
-                  f"Sincerely,\n[Adjuster Name]\n[Company Name] Claims Department"
-                  f"{red_flags_section}\n"
-              )
+              name = llm_verdict.get("claimant_name", "").strip()
+              salutation = f"Dear {name}," if name else "Dear Claimant,"
+              if final_status == "APPROVE":
+                  body = llm_verdict.get("client_letter", "")
+                  client_letter = f"{salutation}\n\n{body}{_CLAIMANT_CLOSE}\n"
+              elif final_status == "DENY":
+                  body = llm_verdict.get("client_letter", "").strip()
+                  if not body:
+                      body = "We have completed our review of your insurance claim and regret that we are unable to approve your request."
+                  denial_reasons = llm_verdict.get("denial_reasons", [])
+                  reasons_block = ""
+                  if denial_reasons:
+                      bullets = "\n".join(f"  - {r}" for r in denial_reasons)
+                      reasons_block = f"\n\nReason(s) for this decision:\n{bullets}"
+                  appeal = (
+                      "\n\nIf you disagree with this decision, you have the right to appeal"
+                      " within 30 days by contacting our Claims Appeals Department at"
+                      " claims-appeals@example.com or by calling 1-800-CLAIMS-2."
+                  )
+                  client_letter = f"{salutation}\n\n{body}{reasons_block}{appeal}{_CLAIMANT_CLOSE}\n"
+              else:
+                  client_letter = (
+                      f"{salutation}\n\n{_NEEDS_REVIEW_LETTER}"
+                      f"\n\nYour claim reference: {claim_id}{_CLAIMANT_CLOSE}\n"
+                  )
+
               s3.put_object(
                   Bucket=decisions_bucket,
-                  Key=f"{prefix}/adjuster_email.md",
-                  Body=email_md.encode(),
+                  Key=f"{prefix}/client_letter.txt",
+                  Body=client_letter.encode("ascii", errors="replace"),
+                  ContentType="text/plain",
+              )
+
+              confidence = llm_verdict["confidence"]
+              original_rec = llm_verdict["recommendation"]
+              override_section = f"\n## Override\n{override_reason}\n" if override_reason else ""
+              red_flags = llm_verdict.get("red_flags", [])
+              red_flags_block = "None" if not red_flags else "\n".join(f"- {f}" for f in red_flags)
+              approval_rationale = llm_verdict.get("approval_rationale", "")
+              approval_section = f"\n## Approval Rationale\n{approval_rationale}\n" if approval_rationale else ""
+              denial_reasons = llm_verdict.get("denial_reasons", [])
+              denial_section = ""
+              if denial_reasons:
+                  bullets = "\n".join(f"- {r}" for r in denial_reasons)
+                  denial_section = f"\n## Denial Reasons\n{bullets}\n"
+              raw_json = json.dumps(llm_verdict, indent=2)
+
+              adjuster_brief = (
+                  f"# Adjuster Brief - Claim {claim_id}\n"
+                  f"**Client:** {client_id}\n"
+                  f"**Processed:** {created_at}\n"
+                  f"**Final Status:** {final_status}\n"
+                  f"\n## Summary\n{llm_verdict.get('adjuster_summary', '')}\n"
+                  f"\n## Recommendation and Confidence\n"
+                  f"- Original recommendation: {original_rec}\n"
+                  f"- Confidence: {confidence:.0%}\n"
+                  f"- Final status: {final_status}\n"
+                  f"{override_section}"
+                  f"\n## Reasoning\n{llm_verdict.get('reasoning', '')}\n"
+                  f"\n## Red Flags\n{red_flags_block}\n"
+                  f"{approval_section}"
+                  f"{denial_section}"
+                  f"\n## Original Bedrock Output\n```json\n{raw_json}\n```\n"
+              )
+
+              s3.put_object(
+                  Bucket=decisions_bucket,
+                  Key=f"{prefix}/adjuster_brief.md",
+                  Body=adjuster_brief.encode(),
                   ContentType="text/markdown",
+              )
+
+              adj_red_flags = llm_verdict.get("red_flags", [])
+              adj_red_flags_block = "None" if not adj_red_flags else "\n".join(f"- {f}" for f in adj_red_flags)
+              adjuster_notification = (
+                  f"Claim {claim_id} ({client_id}) requires adjuster review.\n\n"
+                  f"Summary:\n{llm_verdict.get('adjuster_summary', '')}\n\n"
+                  f"Reasoning:\n{llm_verdict.get('reasoning', '')}\n\n"
+                  f"Red Flags:\n{adj_red_flags_block}\n\n"
+                  f"Full brief: s3://{decisions_bucket}/{prefix}/adjuster_brief.md"
               )
 
               bundle = {
                   "decision": decision,
-                  "llm_verdict": event.get("llm_verdict", {}),
+                  "llm_verdict": llm_verdict,
                   "evidence": event.get("evidence", {}),
               }
               s3.put_object(
@@ -1138,28 +970,30 @@ Resources:
               dynamodb.put_item(
                   TableName=TABLE_NAME,
                   Item={
-                      "client_id": {"S": client_id},
-                      "claim_id": {"S": claim_id},
-                      "submitted_at": {"S": event.get("submitted_at", "")},
-                      "processed_at": {"S": created_at},
-                      "final_status": {"S": decision["final_status"]},
-                      "original_recommendation": {"S": decision["original_recommendation"]},
-                      "confidence": {"N": str(decision["confidence"])},
-                      "requires_adjuster_review": {"BOOL": decision["requires_adjuster_review"]},
-                      "reasoning": {"S": decision["reasoning"][:1000]},
-                      "red_flags": {"S": json.dumps(decision["red_flags"])},
-                      "decision_s3_prefix": {"S": f"s3://{decisions_bucket}/{prefix}/"},
-                      "ttl": {"N": str(ttl)},
+                      "client_id":              {"S": client_id},
+                      "claim_id":               {"S": claim_id},
+                      "submitted_at":           {"S": event.get("submitted_at", "")},
+                      "processed_at":           {"S": created_at},
+                      "final_status":           {"S": final_status},
+                      "original_recommendation": {"S": original_rec},
+                      "confidence":             {"N": str(confidence)},
+                      "override_reason":        {"S": override_reason or ""},
+                      "reasoning":              {"S": llm_verdict.get("reasoning", "")[:1000]},
+                      "approval_rationale":     {"S": approval_rationale},
+                      "denial_reasons":         {"S": json.dumps(denial_reasons)},
+                      "red_flags":              {"S": json.dumps(red_flags)},
+                      "decision_s3_prefix":     {"S": f"s3://{decisions_bucket}/{prefix}/"},
+                      "ttl":                    {"N": str(ttl)},
                   },
               )
 
               return {
                   "client_id": client_id,
                   "claim_id": claim_id,
-                  "final_status": decision["final_status"],
+                  "final_status": final_status,
                   "decision_s3_prefix": f"s3://{decisions_bucket}/{prefix}/",
-                  "requires_adjuster_review": decision["requires_adjuster_review"],
-                  "adjuster_email_text": email_md,
+                  "client_letter": client_letter,
+                  "adjuster_brief": adjuster_notification,
               }
       Environment:
         Variables:
@@ -1182,17 +1016,15 @@ Resources:
               LogGroupArn: !GetAtt StateMachineLogGroup.Arn
       DefinitionSubstitutions:
         ReadManifestFunctionArn: !GetAtt ReadManifestFunction.Arn
-        ValidateArtifactsPresentFunctionArn: !GetAtt ValidateArtifactsFunction.Arn
         ReadTextFunctionArn: !GetAtt ReadTextFunction.Arn
-        NormalizeEvidenceFunctionArn: !GetAtt NormalizeEvidenceFunction.Arn
         SynthesizeVerdictFunctionArn: !GetAtt SynthesizeVerdictFunction.Arn
-        ApplyGuardrailsFunctionArn: !GetAtt ApplyGuardrailsFunction.Arn
         WriteArtifactsFunctionArn: !GetAtt WriteArtifactsFunction.Arn
         AdjusterNotificationsTopicArn: !Ref AdjusterNotificationsTopic
-        ClaimsDecisionsTableName: !Sub "${AWS::StackName}-ClaimsDecisions"
+        SenderEmail: !Ref SenderEmail
+        ClaimantEmail: !Ref ClaimantEmail
       DefinitionString: |
         {
-          "Comment": "insurance-claims-ai-pipeline: reads a claim manifest, validates artifacts, fans out per-artifact to Rekognition/Textract/ReadText, normalizes evidence, calls Bedrock for a recommendation, applies guardrails, writes results to S3 and DynamoDB, notifies adjuster if review is required.",
+          "Comment": "insurance-claims-ai-pipeline: 4-Lambda design. ReadManifest -> ValidateArtifacts (Map/HeadObject) -> ProcessArtifacts (Map) -> BuildEvidence (Pass) -> SynthesizeVerdict -> GuardrailCheck -> WriteArtifacts -> RouteDecision (SES claimant email + SNS adjuster topic).",
           "StartAt": "ReadManifest",
           "States": {
             "ReadManifest": {
@@ -1212,24 +1044,30 @@ Resources:
                 }
               ],
               "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
-              "Next": "ValidateArtifactsPresent"
+              "Next": "ValidateArtifacts"
             },
-            "ValidateArtifactsPresent": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "${ValidateArtifactsPresentFunctionArn}",
-                "Payload.$": "$"
-              },
-              "ResultSelector": { "body.$": "$.Payload" },
-              "ResultPath": "$",
-              "OutputPath": "$.body",
-              "Retry": [
-                {
-                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
-                  "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+            "ValidateArtifacts": {
+              "Type": "Map",
+              "ItemsPath": "$.artifacts",
+              "ItemSelector": { "artifact.$": "$$.Map.Item.Value" },
+              "MaxConcurrency": 10,
+              "ResultPath": null,
+              "ItemProcessor": {
+                "ProcessorConfig": { "Mode": "INLINE" },
+                "StartAt": "HeadObject",
+                "States": {
+                  "HeadObject": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+                    "Parameters": {
+                      "Bucket.$": "$.artifact.intake_bucket",
+                      "Key.$": "$.artifact.key"
+                    },
+                    "ResultPath": null,
+                    "End": true
+                  }
                 }
-              ],
+              },
               "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
               "Next": "ProcessArtifacts"
             },
@@ -1266,6 +1104,7 @@ Resources:
                       "MinConfidence": 50
                     },
                     "ResultSelector": { "type": "image", "Labels.$": "$.Labels" },
+                    "ResultPath": "$.analysis",
                     "Retry": [
                       {
                         "ErrorEquals": ["Rekognition.ProvisionedThroughputExceededException"],
@@ -1287,6 +1126,7 @@ Resources:
                       "FeatureTypes": ["FORMS", "TABLES"]
                     },
                     "ResultSelector": { "type": "document", "Blocks.$": "$.Blocks" },
+                    "ResultPath": "$.analysis",
                     "Retry": [
                       {
                         "ErrorEquals": ["Textract.ProvisionedThroughputExceededException"],
@@ -1302,9 +1142,15 @@ Resources:
                       "FunctionName": "${ReadTextFunctionArn}",
                       "Payload.$": "$"
                     },
-                    "ResultSelector": { "body.$": "$.Payload" },
-                    "ResultPath": "$",
-                    "OutputPath": "$.body",
+                    "ResultSelector": {
+                      "type.$": "$.Payload.type",
+                      "key.$": "$.Payload.key",
+                      "content.$": "$.Payload.content",
+                      "sentiment.$": "$.Payload.sentiment",
+                      "sentiment_scores.$": "$.Payload.sentiment_scores",
+                      "key_phrases.$": "$.Payload.key_phrases"
+                    },
+                    "ResultPath": "$.analysis",
                     "Retry": [
                       {
                         "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException"],
@@ -1321,25 +1167,19 @@ Resources:
                 }
               },
               "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
-              "Next": "NormalizeEvidence"
+              "Next": "BuildEvidence"
             },
-            "NormalizeEvidence": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
+            "BuildEvidence": {
+              "Type": "Pass",
               "Parameters": {
-                "FunctionName": "${NormalizeEvidenceFunctionArn}",
-                "Payload.$": "$"
-              },
-              "ResultSelector": { "body.$": "$.Payload" },
-              "ResultPath": "$",
-              "OutputPath": "$.body",
-              "Retry": [
-                {
-                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException"],
-                  "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0
+                "client_id.$": "$.client_id",
+                "claim_id.$": "$.claim_id",
+                "submitted_at.$": "$.submitted_at",
+                "decisions_bucket.$": "$.decisions_bucket",
+                "evidence": {
+                  "artifacts.$": "$.artifact_results"
                 }
-              ],
-              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              },
               "Next": "SynthesizeVerdict"
             },
             "SynthesizeVerdict": {
@@ -1359,19 +1199,44 @@ Resources:
                 }
               ],
               "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
-              "Next": "ApplyGuardrails"
+              "Next": "GuardrailCheck"
             },
-            "ApplyGuardrails": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
+            "GuardrailCheck": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.llm_verdict.confidence",
+                  "NumericLessThan": 0.85,
+                  "Next": "ForceNeedsReview"
+                }
+              ],
+              "Default": "PassThroughVerdict"
+            },
+            "ForceNeedsReview": {
+              "Type": "Pass",
               "Parameters": {
-                "FunctionName": "${ApplyGuardrailsFunctionArn}",
-                "Payload.$": "$"
+                "client_id.$": "$.client_id",
+                "claim_id.$": "$.claim_id",
+                "submitted_at.$": "$.submitted_at",
+                "decisions_bucket.$": "$.decisions_bucket",
+                "evidence.$": "$.evidence",
+                "llm_verdict.$": "$.llm_verdict",
+                "final_status": "NEEDS_REVIEW",
+                "override_reason.$": "States.Format('Guardrail downgrade: original={}, confidence={}', $.llm_verdict.recommendation, $.llm_verdict.confidence)"
               },
-              "ResultSelector": { "body.$": "$.Payload" },
-              "ResultPath": "$",
-              "OutputPath": "$.body",
-              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+              "Next": "WriteArtifacts"
+            },
+            "PassThroughVerdict": {
+              "Type": "Pass",
+              "Parameters": {
+                "client_id.$": "$.client_id",
+                "claim_id.$": "$.claim_id",
+                "submitted_at.$": "$.submitted_at",
+                "decisions_bucket.$": "$.decisions_bucket",
+                "evidence.$": "$.evidence",
+                "llm_verdict.$": "$.llm_verdict",
+                "final_status.$": "$.llm_verdict.recommendation"
+              },
               "Next": "WriteArtifacts"
             },
             "WriteArtifacts": {
@@ -1384,58 +1249,85 @@ Resources:
               "ResultSelector": { "body.$": "$.Payload" },
               "ResultPath": "$",
               "OutputPath": "$.body",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0
+                }
+              ],
               "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
-              "Next": "ShouldNotifyAdjuster"
+              "Next": "RouteDecision"
             },
-            "ShouldNotifyAdjuster": {
+            "RouteDecision": {
               "Type": "Choice",
               "Choices": [
-                { "Variable": "$.requires_adjuster_review", "BooleanEquals": true, "Next": "NotifyAdjuster" }
+                { "Variable": "$.final_status", "StringEquals": "APPROVE", "Next": "NotifyClaimantApproved" },
+                { "Variable": "$.final_status", "StringEquals": "DENY", "Next": "NotifyClaimantDenied" }
               ],
-              "Default": "ClaimProcessed"
+              "Default": "NotifyAdjuster"
+            },
+            "NotifyClaimantApproved": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sesv2:sendEmail",
+              "Parameters": {
+                "FromEmailAddress": "${SenderEmail}",
+                "Destination": { "ToAddresses": ["${ClaimantEmail}"] },
+                "Content": {
+                  "Simple": {
+                    "Subject": { "Data.$": "States.Format('Update on your claim {} - Approved', $.claim_id)", "Charset": "UTF-8" },
+                    "Body": { "Text": { "Data.$": "$.client_letter", "Charset": "UTF-8" } }
+                  }
+                }
+              },
+              "ResultPath": null,
+              "Next": "ClaimApproved"
+            },
+            "NotifyClaimantDenied": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sesv2:sendEmail",
+              "Parameters": {
+                "FromEmailAddress": "${SenderEmail}",
+                "Destination": { "ToAddresses": ["${ClaimantEmail}"] },
+                "Content": {
+                  "Simple": {
+                    "Subject": { "Data.$": "States.Format('Update on your claim {} - Decision', $.claim_id)", "Charset": "UTF-8" },
+                    "Body": { "Text": { "Data.$": "$.client_letter", "Charset": "UTF-8" } }
+                  }
+                }
+              },
+              "ResultPath": null,
+              "Next": "ClaimDenied"
             },
             "NotifyAdjuster": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:sns:publish",
               "Parameters": {
                 "TopicArn": "${AdjusterNotificationsTopicArn}",
-                "Subject.$": "States.Format('Claim {} requires adjuster review - status: {}', $.claim_id, $.final_status)",
-                "Message.$": "$.adjuster_email_text"
+                "Subject.$": "States.Format('Claim {} requires adjuster review', $.claim_id)",
+                "Message.$": "$.adjuster_brief"
               },
               "ResultPath": null,
-              "Next": "ClaimProcessed"
+              "Next": "ClaimNeedsReview"
             },
-            "ClaimProcessed": {
+            "ClaimApproved": {
+              "Type": "Succeed"
+            },
+            "ClaimDenied": {
+              "Type": "Succeed"
+            },
+            "ClaimNeedsReview": {
               "Type": "Succeed"
             },
             "RecordFailure": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
-              "Parameters": {
-                "TableName": "${ClaimsDecisionsTableName}",
-                "Item": {
-                  "client_id": { "S": "PIPELINE_ERROR" },
-                  "claim_id": { "S.$": "$$.Execution.Name" },
-                  "final_status": { "S": "FAILED" },
-                  "error_detail": { "S.$": "States.JsonToString($.error)" },
-                  "processed_at": { "S.$": "$$.Execution.StartTime" }
-                }
-              },
-              "ResultPath": null,
-              "Next": "ClaimFailed"
-            },
-            "ClaimFailed": {
               "Type": "Fail",
               "Error": "ClaimProcessingFailed",
-              "Cause": "An error occurred during claim processing. See DynamoDB ClaimsDecisions table (PK=PIPELINE_ERROR, SK=execution-name) and SFN execution history for details."
+              "Cause": "An error occurred during claim processing. See SFN execution history and CloudWatch Logs for details."
             }
           }
         }
 
   # -------------------------------------------------------------------------
   # EventBridge -- fires on manifest.json object created in intake bucket
-  # DependsOn: ClaimsStateMachine avoids the rule referencing a non-existent
-  # state machine ARN during stack creation.
   # -------------------------------------------------------------------------
   IntakeManifestRule:
     Type: AWS::Events::Rule
@@ -1490,14 +1382,16 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-TableName"
 
-  TopicArn:
-    Description: SNS adjuster notifications topic ARN
+  AdjusterTopicArn:
+    Description: SNS adjuster notifications topic ARN (NEEDS_REVIEW path)
     Value: !Ref AdjusterNotificationsTopic
     Export:
-      Name: !Sub "${AWS::StackName}-TopicArn"
+      Name: !Sub "${AWS::StackName}-AdjusterTopicArn"
 
-  KmsKeyArn:
-    Description: KMS key ARN used for SSE on all resources
-    Value: !GetAtt KmsKey.Arn
+  SenderEmailAddress:
+    Description: SES verified sender address used for claimant notifications (APPROVE and DENY paths)
+    Value: !Ref SenderEmail
     Export:
-      Name: !Sub "${AWS::StackName}-KmsKeyArn"
+      Name: !Sub "${AWS::StackName}-SenderEmailAddress"
+
+
